@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/k8s-rollout-restart/pkg/logger"
+	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"

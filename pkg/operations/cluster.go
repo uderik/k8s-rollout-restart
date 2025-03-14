@@ -3,200 +3,289 @@ package operations
 import (
 	"context"
 	"fmt"
-	"sort"
+	"sync"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
-// ClusterOperations handles cluster-wide operations
+// ClusterOperations handles cluster-related operations
 type ClusterOperations struct {
-	client    *kubernetes.Clientset
+	clientset K8sClient
 	parallel  int
 	timeout   int
-	noFlagger bool
+	nodes     map[string]bool // map of node names that were cordoned
 	dryRun    bool
+	noFlagger bool
+	log       *logger.Logger
 }
 
 // NewClusterOperations creates a new ClusterOperations instance
-func NewClusterOperations(client *kubernetes.Clientset, parallel, timeout int, noFlagger bool, dryRun bool) *ClusterOperations {
+func NewClusterOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool) *ClusterOperations {
 	return &ClusterOperations{
-		client:    client,
+		clientset: clientset,
 		parallel:  parallel,
 		timeout:   timeout,
-		noFlagger: noFlagger,
+		nodes:     make(map[string]bool),
 		dryRun:    dryRun,
+		noFlagger: noFlagger,
+		log:       logger.NewLogger(dryRun),
 	}
 }
 
-// CordonNodes marks selected nodes as unschedulable
-// If namespace is provided, only nodes running pods from that namespace will be cordoned
-func (c *ClusterOperations) CordonNodes(ctx context.Context, namespace string) error {
-	// Get all nodes first
-	allNodes, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+// CordonNodes cordons all nodes with pods from the namespaces
+func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string) error {
+	if len(namespaces) == 0 {
+		c.log.Info("No namespaces specified, skipping node cordon")
+		return nil
+	}
+
+	// Get all nodes
+	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list nodes: %w", err)
 	}
 
-	// If no namespace specified, cordon all nodes
-	if namespace == "" {
-		return c.cordonNodeList(ctx, allNodes.Items)
-	}
+	// Map for node names to check
+	nodeNames := make(map[string]bool)
 
-	// If namespace specified, get nodes that have pods from this namespace
-	pods, err := c.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
-	}
+	// For each namespace, find nodes with pods
+	for _, namespace := range namespaces {
+		// Get all pods in the namespace
+		pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+		}
 
-	// Create a map of node names to avoid duplicates
-	nodesWithNamespacedPods := make(map[string]corev1.Node)
-	for _, pod := range pods.Items {
-		// Find the node this pod is running on
-		for _, node := range allNodes.Items {
-			if node.Name == pod.Spec.NodeName {
-				nodesWithNamespacedPods[node.Name] = node
-				break
-			}
+		// Find nodes with pods from the namespace
+		for _, pod := range pods.Items {
+			nodeNames[pod.Spec.NodeName] = true
 		}
 	}
 
-	// Convert map to slice for processing
-	var nodesToCordon []corev1.Node
-	for _, node := range nodesWithNamespacedPods {
-		nodesToCordon = append(nodesToCordon, node)
-	}
-
-	// Sort nodes by name for consistent output
-	sort.Slice(nodesToCordon, func(i, j int) bool {
-		return nodesToCordon[i].Name < nodesToCordon[j].Name
-	})
-
-	if len(nodesToCordon) == 0 {
-		if c.dryRun {
-			fmt.Printf("\nNo nodes have pods from namespace %s, nothing to cordon\n", namespace)
-		}
+	if len(nodeNames) == 0 {
+		c.log.Warning("No nodes found with pods from specified namespaces, skipping cordon")
 		return nil
 	}
 
-	return c.cordonNodeList(ctx, nodesToCordon)
-}
+	c.log.Info("Found %d nodes with pods from specified namespaces", len(nodeNames))
 
-// cordonNodeList handles cordoning a specific list of nodes
-func (c *ClusterOperations) cordonNodeList(ctx context.Context, nodes []corev1.Node) error {
 	if c.dryRun {
-		fmt.Printf("\nNodes that would be cordoned:\n")
-		for _, node := range nodes {
-			if !node.Spec.Unschedulable {
-				fmt.Printf("- %s\n", node.Name)
-			} else {
-				fmt.Printf("- %s (already cordoned)\n", node.Name)
-			}
+		c.log.Info("Would cordon the following nodes:")
+		for node := range nodeNames {
+			c.log.Info("- %s", node)
 		}
 		return nil
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(c.parallel)
+	// Cordon each node
+	var wg sync.WaitGroup
+	ch := make(chan string, c.parallel)
+	errCh := make(chan error, len(nodes.Items))
 
-	for _, node := range nodes {
-		node := node // capture range variable
-		g.Go(func() error {
-			node.Spec.Unschedulable = true
-			_, err := c.client.CoreV1().Nodes().Update(ctx, &node, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to cordon node %s: %w", node.Name, err)
+	for i := 0; i < c.parallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for nodeName := range ch {
+				if err := c.cordonNode(ctx, nodeName); err != nil {
+					errCh <- fmt.Errorf("failed to cordon node %s: %w", nodeName, err)
+					return
+				}
 			}
-			return nil
-		})
+		}()
 	}
 
-	return g.Wait()
+	// Send nodes to cordon
+	for nodeName := range nodeNames {
+		ch <- nodeName
+	}
+	close(ch)
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for errors
+	for err := range errCh {
+		return err
+	}
+
+	return nil
 }
 
-// UncordonNodes marks selected nodes as schedulable
-// If namespace is provided, only nodes running pods from that namespace will be uncordoned
-func (c *ClusterOperations) UncordonNodes(ctx context.Context, namespace string) error {
-	// Get all nodes first
-	allNodes, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list nodes: %w", err)
-	}
-
-	// If no namespace specified, uncordon all nodes
-	if namespace == "" {
-		return c.uncordonNodeList(ctx, allNodes.Items)
-	}
-
-	// If namespace specified, get nodes that have pods from this namespace
-	pods, err := c.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
-	}
-
-	// Create a map of node names to avoid duplicates
-	nodesWithNamespacedPods := make(map[string]corev1.Node)
-	for _, pod := range pods.Items {
-		// Find the node this pod is running on
-		for _, node := range allNodes.Items {
-			if node.Name == pod.Spec.NodeName {
-				nodesWithNamespacedPods[node.Name] = node
-				break
-			}
-		}
-	}
-
-	// Convert map to slice for processing
-	var nodesToUncordon []corev1.Node
-	for _, node := range nodesWithNamespacedPods {
-		nodesToUncordon = append(nodesToUncordon, node)
-	}
-
-	// Sort nodes by name for consistent output
-	sort.Slice(nodesToUncordon, func(i, j int) bool {
-		return nodesToUncordon[i].Name < nodesToUncordon[j].Name
-	})
-
-	if len(nodesToUncordon) == 0 {
-		if c.dryRun {
-			fmt.Printf("\nNo nodes have pods from namespace %s, nothing to uncordon\n", namespace)
-		}
-		return nil
-	}
-
-	return c.uncordonNodeList(ctx, nodesToUncordon)
-}
-
-// uncordonNodeList handles uncordoning a specific list of nodes
-func (c *ClusterOperations) uncordonNodeList(ctx context.Context, nodes []corev1.Node) error {
+// UncordonNodes uncordons all nodes previously cordoned
+func (c *ClusterOperations) UncordonNodes(ctx context.Context, namespaces []string) error {
 	if c.dryRun {
-		fmt.Printf("\nNodes that would be uncordoned:\n")
-		for _, node := range nodes {
-			if node.Spec.Unschedulable {
-				fmt.Printf("- %s\n", node.Name)
-			} else {
-				fmt.Printf("- %s (already schedulable)\n", node.Name)
-			}
+		c.log.Info("Would uncordon the following nodes:")
+		for node := range c.nodes {
+			c.log.Info("- %s", node)
 		}
 		return nil
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(c.parallel)
+	// If nodes is empty, recreate list from namespaces
+	if len(c.nodes) == 0 {
+		// Get all nodes
+		nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to list nodes: %w", err)
+		}
 
-	for _, node := range nodes {
-		node := node // capture range variable
-		g.Go(func() error {
-			node.Spec.Unschedulable = false
-			_, err := c.client.CoreV1().Nodes().Update(ctx, &node, metav1.UpdateOptions{})
+		// Get all pods for namespaces
+		var allPods []corev1.Pod
+		for _, namespace := range namespaces {
+			pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 			if err != nil {
-				return fmt.Errorf("failed to uncordon node %s: %w", node.Name, err)
+				return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
 			}
-			return nil
-		})
+			allPods = append(allPods, pods.Items...)
+		}
+
+		// Add cordoned nodes to our tracking map
+		for _, node := range nodes.Items {
+			if node.Spec.Unschedulable && c.hasPodFromNamespaces(node.Name, allPods, namespaces) {
+				c.nodes[node.Name] = true
+			}
+		}
 	}
 
-	return g.Wait()
+	if len(c.nodes) == 0 {
+		c.log.Info("No cordoned nodes found, skipping uncordon")
+		return nil
+	}
+
+	// Uncordon each node
+	var wg sync.WaitGroup
+	ch := make(chan string, c.parallel)
+	errCh := make(chan error, len(c.nodes))
+
+	for i := 0; i < c.parallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for nodeName := range ch {
+				if err := c.uncordonNode(ctx, nodeName); err != nil {
+					errCh <- fmt.Errorf("failed to uncordon node %s: %w", nodeName, err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Send nodes to uncordon
+	for nodeName := range c.nodes {
+		ch <- nodeName
+	}
+	close(ch)
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for errors
+	for err := range errCh {
+		return err
+	}
+
+	return nil
+}
+
+// cordonNode marks a node as unschedulable
+func (c *ClusterOperations) cordonNode(ctx context.Context, nodeName string) error {
+	node, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("metadata.name=%s", nodeName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get node: %w", err)
+	}
+
+	if len(node.Items) == 0 {
+		return fmt.Errorf("node %s not found", nodeName)
+	}
+
+	nodeObj := node.Items[0]
+
+	// Skip if already cordoned
+	if nodeObj.Spec.Unschedulable {
+		c.log.Info("Node %s already cordoned, skipping", nodeName)
+		return nil
+	}
+
+	// Mark node as unschedulable
+	nodeObj.Spec.Unschedulable = true
+
+	// Update node
+	_, err = c.clientset.CoreV1().Nodes().Update(ctx, &nodeObj, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update node: %w", err)
+	}
+
+	// Mark node as cordoned in our tracking map
+	c.nodes[nodeName] = true
+
+	c.log.Success("Node %s cordoned successfully", nodeName)
+	return nil
+}
+
+// uncordonNode marks a node as schedulable
+func (c *ClusterOperations) uncordonNode(ctx context.Context, nodeName string) error {
+	node, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("metadata.name=%s", nodeName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get node: %w", err)
+	}
+
+	if len(node.Items) == 0 {
+		return fmt.Errorf("node %s not found", nodeName)
+	}
+
+	nodeObj := node.Items[0]
+
+	// Skip if already uncordoned
+	if !nodeObj.Spec.Unschedulable {
+		c.log.Info("Node %s already uncordoned, skipping", nodeName)
+		return nil
+	}
+
+	// Mark node as schedulable
+	nodeObj.Spec.Unschedulable = false
+
+	// Update node
+	_, err = c.clientset.CoreV1().Nodes().Update(ctx, &nodeObj, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update node: %w", err)
+	}
+
+	// Remove node from our tracking map
+	delete(c.nodes, nodeName)
+
+	c.log.Success("Node %s uncordoned successfully", nodeName)
+	return nil
+}
+
+// hasPodFromNamespace checks if a node has pods from a namespace
+func (c *ClusterOperations) hasPodFromNamespace(nodeName string, pods []corev1.Pod) bool {
+	for _, pod := range pods {
+		if pod.Spec.NodeName == nodeName {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPodFromNamespaces checks if a node has pods from any of the namespaces
+func (c *ClusterOperations) hasPodFromNamespaces(nodeName string, pods []corev1.Pod, namespaces []string) bool {
+	// Create a map for faster lookups
+	nsMap := make(map[string]bool)
+	for _, ns := range namespaces {
+		nsMap[ns] = true
+	}
+
+	for _, pod := range pods {
+		if pod.Spec.NodeName == nodeName && nsMap[pod.Namespace] {
+			return true
+		}
+	}
+	return false
 }
