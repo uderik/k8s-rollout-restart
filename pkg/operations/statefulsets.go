@@ -72,6 +72,92 @@ func (s *StatefulSetOperations) RestartStatefulSets(ctx context.Context, namespa
 
 // restartStatefulSetsInNamespace restarts all statefulsets in a single namespace
 func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Context, namespace string) error {
+	s.log.Info("Restarting StatefulSets in namespace: %s", namespace)
+
+	statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list StatefulSets in namespace %s: %w", namespace, err)
+	}
+
+	if len(statefulsets.Items) == 0 {
+		s.log.Info("No StatefulSets found in namespace: %s", namespace)
+		return nil
+	}
+
+	// Track which StatefulSets we'll restart and which we'll skip
+	var toRestart []appsv1.StatefulSet
+	var postgresOperatorStatefulSets []string
+
+	// Filter StatefulSets
+	for _, statefulset := range statefulsets.Items {
+		// Skip StatefulSets managed by Zalando PostgreSQL Operator
+		if s.isPostgresOperatorStatefulSet(&statefulset) {
+			postgresOperatorStatefulSets = append(postgresOperatorStatefulSets,
+				fmt.Sprintf("%s (controlled by Zalando PostgreSQL Operator)", statefulset.Name))
+			continue
+		}
+
+		// Apply age filter if specified
+		if s.minAge != nil {
+			age := time.Since(statefulset.CreationTimestamp.Time)
+			if age < *s.minAge {
+				s.log.Info("Skipping StatefulSet %s/%s: too new (age: %s, required: %s)",
+					namespace, statefulset.Name, age.Round(time.Second), *s.minAge)
+				continue
+			}
+		}
+
+		toRestart = append(toRestart, statefulset)
+	}
+
+	// Log the skipped PostgreSQL Operator StatefulSets
+	if len(postgresOperatorStatefulSets) > 0 {
+		s.log.Info("Skipping the following StatefulSets in namespace %s (will be restarted via PostgreSQL Operator):", namespace)
+		for _, name := range postgresOperatorStatefulSets {
+			s.log.Info("- %s", name)
+		}
+	}
+
+	// If no StatefulSets to restart after filtering
+	if len(toRestart) == 0 {
+		s.log.Info("No eligible StatefulSets to restart in namespace: %s", namespace)
+		return nil
+	}
+
+	s.log.Info("Found %d StatefulSet(s) to restart in namespace: %s", len(toRestart), namespace)
+
+	if s.dryRun {
+		for _, statefulset := range toRestart {
+			s.log.Info("Would restart StatefulSet: %s/%s", namespace, statefulset.Name)
+		}
+		return nil
+	}
+
+	// Process each StatefulSet that passed the filters
+	for _, statefulset := range toRestart {
+		s.log.Info("Restarting StatefulSet: %s/%s", namespace, statefulset.Name)
+
+		if err := s.triggerStatefulSetRollout(ctx, namespace, statefulset.Name); err != nil {
+			return fmt.Errorf("failed to trigger rollout for StatefulSet %s/%s: %w", namespace, statefulset.Name, err)
+		}
+
+		s.log.Success("Successfully triggered rollout for StatefulSet: %s/%s", namespace, statefulset.Name)
+	}
+
+	// Wait for all StatefulSets to be ready if there are any
+	if len(toRestart) > 0 {
+		s.log.Info("Waiting for all StatefulSets to be ready in namespace: %s", namespace)
+		if err := s.waitForStatefulSetsReady(ctx, namespace); err != nil {
+			return fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err)
+		}
+		s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
+	}
+
+	return nil
+}
+
+// waitForStatefulSetsReady waits for all specified statefulsets to be ready after restart
+func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, namespace string) error {
 	// List all statefulsets in the namespace
 	statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -79,127 +165,17 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 	}
 
 	if len(statefulsets.Items) == 0 {
-		s.log.Info("No statefulsets found in namespace %s", namespace)
-		return nil
-	}
-
-	s.log.Info("Found %d statefulset(s) in namespace %s", len(statefulsets.Items), namespace)
-
-	statefulSetsToRestart := make([]appsv1.StatefulSet, 0)
-	tooYoungStatefulSets := make([]appsv1.StatefulSet, 0)
-
-	// Include all statefulsets for restart
-	for _, statefulset := range statefulsets.Items {
-		// Check if statefulset is old enough to restart
-		if s.minAge != nil {
-			if time.Since(statefulset.CreationTimestamp.Time) < *s.minAge {
-				tooYoungStatefulSets = append(tooYoungStatefulSets, statefulset)
-				continue
-			}
-		}
-
-		statefulSetsToRestart = append(statefulSetsToRestart, statefulset)
-	}
-
-	if len(statefulSetsToRestart) == 0 {
-		s.log.Info("No statefulsets found to restart in namespace %s", namespace)
-		return nil
-	}
-
-	s.log.Info("Will restart %d/%d statefulset(s) in namespace %s",
-		len(statefulSetsToRestart), len(statefulsets.Items), namespace)
-
-	if s.dryRun {
-		s.log.Info("StatefulSets that would be restarted in namespace %s:", namespace)
-		for _, statefulset := range statefulSetsToRestart {
-			s.log.Info("- %s", statefulset.Name)
-		}
-
-		if len(tooYoungStatefulSets) > 0 {
-			s.log.Info("\nStatefulSets that would be skipped because they are too new in namespace %s:", namespace)
-			for _, statefulset := range tooYoungStatefulSets {
-				s.log.Info("- %s (age: %s, required: %s)", statefulset.Name,
-					time.Since(statefulset.CreationTimestamp.Time).Round(time.Second),
-					*s.minAge)
-			}
-		}
-
-		return nil
-	}
-
-	// Create a worker pool for parallel processing
-	type restartJob struct {
-		namespace   string
-		statefulset appsv1.StatefulSet
-	}
-
-	jobCh := make(chan restartJob, len(statefulSetsToRestart))
-	workerErrCh := make(chan error, len(statefulSetsToRestart))
-
-	// Start workers
-	var workerWg sync.WaitGroup
-	for i := 0; i < s.parallel; i++ {
-		workerWg.Add(1)
-		go func() {
-			defer workerWg.Done()
-			for job := range jobCh {
-				// Patch statefulset to trigger a rolling update
-				patchData := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`, time.Now().Format(time.RFC3339))
-				_, err := s.clientset.AppsV1().StatefulSets(job.namespace).Patch(ctx, job.statefulset.Name, types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
-				if err != nil {
-					workerErrCh <- fmt.Errorf("failed to patch statefulset %s/%s: %w", job.namespace, job.statefulset.Name, err)
-					return
-				}
-
-				s.log.Success("Successfully restarted statefulset %s/%s", job.namespace, job.statefulset.Name)
-			}
-		}()
-	}
-
-	// Send jobs to workers
-	for _, statefulset := range statefulSetsToRestart {
-		s.log.Info("Restarting statefulset %s/%s", namespace, statefulset.Name)
-		jobCh <- restartJob{
-			namespace:   namespace,
-			statefulset: statefulset,
-		}
-	}
-
-	close(jobCh)
-	workerWg.Wait()
-	close(workerErrCh)
-
-	// Check for errors
-	for err := range workerErrCh {
-		return err // Return first error encountered
-	}
-
-	// Wait for all restarted statefulsets to be ready
-	s.log.Info("Waiting for statefulsets to become ready in namespace %s", namespace)
-	if err := s.waitForStatefulSetsReady(ctx, namespace, statefulSetsToRestart); err != nil {
-		return fmt.Errorf("failed waiting for statefulsets to become ready: %w", err)
-	}
-
-	s.log.Success("Successfully restarted %d statefulset(s) in namespace %s",
-		len(statefulSetsToRestart), namespace)
-
-	return nil
-}
-
-// waitForStatefulSetsReady waits for all specified statefulsets to be ready after restart
-func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, namespace string, statefulsets []appsv1.StatefulSet) error {
-	if len(statefulsets) == 0 {
 		return nil
 	}
 
 	// Create a map of statefulset names for quick lookup with their initial generation
 	statefulsetGenerations := make(map[string]int64)
-	for _, statefulset := range statefulsets {
+	for _, statefulset := range statefulsets.Items {
 		statefulsetGenerations[statefulset.Name] = statefulset.Generation
 	}
 
 	// Wait for statefulsets to be ready
-	s.log.Info("Waiting for %d statefulset(s) in namespace %s to become ready", len(statefulsets), namespace)
+	s.log.Info("Waiting for %d statefulset(s) in namespace %s to become ready", len(statefulsets.Items), namespace)
 
 	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(s.timeout)*time.Second)
@@ -263,4 +239,44 @@ func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, na
 			}
 		}
 	}
+}
+
+// isPostgresOperatorStatefulSet checks if the statefulset is managed by Zalando PostgreSQL Operator
+func (s *StatefulSetOperations) isPostgresOperatorStatefulSet(statefulset *appsv1.StatefulSet) bool {
+	// Check for Zalando PostgreSQL Operator labels
+	if value, exists := statefulset.Labels["application"]; exists && value == "spilo" {
+		return true
+	}
+
+	// Check for Zalando PostgreSQL Operator cluster-name label
+	if _, exists := statefulset.Labels["cluster-name"]; exists {
+		return true
+	}
+
+	// Check for Zalando PostgreSQL Operator team label
+	if _, exists := statefulset.Labels["team"]; exists {
+		if _, exists := statefulset.Labels["cluster-name"]; exists {
+			return true
+		}
+	}
+
+	// Check for Zalando PostgreSQL Operator version label
+	if _, exists := statefulset.Labels["version"]; exists {
+		if _, exists := statefulset.Labels["cluster-name"]; exists {
+			return true
+		}
+	}
+
+	return false
+}
+
+// triggerStatefulSetRollout triggers a rollout for a StatefulSet by adding a restart annotation
+func (s *StatefulSetOperations) triggerStatefulSetRollout(ctx context.Context, namespace, name string) error {
+	// Patch statefulset to trigger a rolling update
+	patchData := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`, time.Now().Format(time.RFC3339))
+	_, err := s.clientset.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to patch StatefulSet %s/%s: %w", namespace, name, err)
+	}
+	return nil
 }

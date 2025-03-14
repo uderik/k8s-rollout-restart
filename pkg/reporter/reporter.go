@@ -41,6 +41,7 @@ type ComponentState struct {
 	StatefulSets int `json:"statefulSets"`
 	DaemonSets   int `json:"daemonSets"`
 	Kafka        int `json:"kafka"`
+	Postgresql   int `json:"postgresql"`
 }
 
 // Reporter handles cluster state reporting
@@ -143,6 +144,25 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 			}
 			if err := json.Unmarshal(kafkaList, &result); err == nil {
 				report.Components.Kafka += len(result.Items)
+			}
+		}
+
+		// Count PostgreSQL resources if available
+		postgresqlList, err := r.client.RESTClient().Get().
+			AbsPath("/apis/acid.zalan.do/v1").
+			Namespace(ns).
+			Resource("postgresqls").
+			DoRaw(ctx)
+		if err == nil {
+			var result struct {
+				Items []struct {
+					Metadata struct {
+						Name string `json:"name"`
+					} `json:"metadata"`
+				} `json:"items"`
+			}
+			if err := json.Unmarshal(postgresqlList, &result); err == nil {
+				report.Components.Postgresql += len(result.Items)
 			}
 		}
 	}

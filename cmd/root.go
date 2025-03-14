@@ -64,7 +64,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text|json)")
 	rootCmd.Flags().BoolVar(&noFlagger, "no-flagger-filter", false, "Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)")
 	rootCmd.Flags().BoolVar(&doCordon, "cordon", false, "Whether to cordon nodes before restart (if not set, nodes will not be cordoned)")
-	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, all)")
+	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all)")
 	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
 
 	// Mark execute and dry-run as mutually exclusive
@@ -87,12 +87,7 @@ func initConfig() {
 }
 
 func runRoot(cmd *cobra.Command, args []string) error {
-	// Verify flags
-	if !dryRun && !execute {
-		return fmt.Errorf("either --dry-run or --execute flag must be specified")
-	}
-
-	// Create logger
+	// Create logger first, to enable logging as early as possible
 	log := logger.NewLogger(dryRun)
 
 	// Set log format if JSON output is requested
@@ -100,10 +95,46 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		log.SetFormat(logger.JSONFormat)
 	}
 
+	// Immediately log the start of execution
+	mode := "DRY-RUN"
+	if execute {
+		mode = "EXECUTE"
+	}
+	log.Info("Starting k8s-rollout-restart in %s mode", mode)
+
+	// Verify flags
+	if !dryRun && !execute {
+		return fmt.Errorf("either --dry-run or --execute flag must be specified")
+	}
+
+	// Validate resource types first, before any expensive operations
+	log.Info("Validating resource types")
+	var restartDeployments, restartStatefulSets, restartKafka, restartPostgresql bool
+	for _, resourceType := range resourceTypes {
+		switch resourceType {
+		case "deployments":
+			restartDeployments = true
+		case "statefulsets":
+			restartStatefulSets = true
+		case "strimzi-kafka":
+			restartKafka = true
+		case "zalando-postgresql":
+			restartPostgresql = true
+		case "all":
+			restartDeployments = true
+			restartStatefulSets = true
+			restartKafka = true
+			restartPostgresql = true
+		default:
+			return fmt.Errorf("invalid resource type: %s", resourceType)
+		}
+	}
+
 	// Initialize rollback manager
 	rollbackMgr := operations.NewRollbackManager(log)
 
 	// Initialize Kubernetes client
+	log.Info("Initializing Kubernetes client")
 	client, err := k8s.NewClient(ctxName)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
@@ -126,6 +157,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	deployOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
 	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
 	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge)
+	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge)
 	rep := reporter.NewReporter(client.Clientset())
 
 	// Setup signal handling with rollback
@@ -156,25 +188,6 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	initialState, err := rep.GenerateReport(ctx, namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate initial report: %w", err)
-	}
-
-	// Parse resource types to determine operations
-	var restartDeployments, restartStatefulSets, restartKafka bool
-	for _, resourceType := range resourceTypes {
-		switch resourceType {
-		case "deployments":
-			restartDeployments = true
-		case "statefulsets":
-			restartStatefulSets = true
-		case "strimzi-kafka":
-			restartKafka = true
-		case "all":
-			restartDeployments = true
-			restartStatefulSets = true
-			restartKafka = true
-		default:
-			return fmt.Errorf("invalid resource type: %s", resourceType)
-		}
 	}
 
 	if dryRun {
@@ -212,6 +225,9 @@ func runRoot(cmd *cobra.Command, args []string) error {
 				if restartKafka {
 					log.Info("- Kafka clusters in namespace %s will be restarted", ns)
 				}
+				if restartPostgresql {
+					log.Info("- PostgreSQL clusters in namespace %s will be restarted", ns)
+				}
 			}
 		} else {
 			if restartDeployments {
@@ -222,6 +238,9 @@ func runRoot(cmd *cobra.Command, args []string) error {
 			}
 			if restartKafka {
 				log.Info("- Kafka clusters: %d", initialState.Components.Kafka)
+			}
+			if restartPostgresql {
+				log.Info("- PostgreSQL clusters: %d", initialState.Components.Postgresql)
 			}
 		}
 
@@ -242,6 +261,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 					log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespaces[0])
 					operationNumber++
 				}
+				if restartPostgresql {
+					log.Info("%d. Restart PostgreSQL clusters in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
 				log.Info("%d. Wait for all components to be ready", operationNumber)
 				operationNumber++
 				log.Info("%d. Uncordon nodes with pods from namespace: %s", operationNumber, namespaces[0])
@@ -257,6 +280,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 				}
 				if restartKafka {
 					log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
+				if restartPostgresql {
+					log.Info("%d. Restart PostgreSQL clusters in namespace: %s", operationNumber, namespaces[0])
 					operationNumber++
 				}
 				log.Info("%d. Wait for all components to be ready", operationNumber)
@@ -277,6 +304,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 					log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
 					operationNumber++
 				}
+				if restartPostgresql {
+					log.Info("%d. Restart PostgreSQL clusters in all namespaces", operationNumber)
+					operationNumber++
+				}
 				log.Info("%d. Wait for all components to be ready", operationNumber)
 				operationNumber++
 				log.Info("%d. Uncordon all nodes", operationNumber)
@@ -292,6 +323,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 				}
 				if restartKafka {
 					log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
+					operationNumber++
+				}
+				if restartPostgresql {
+					log.Info("%d. Restart PostgreSQL clusters in all namespaces", operationNumber)
 					operationNumber++
 				}
 				log.Info("%d. Wait for all components to be ready", operationNumber)
@@ -316,6 +351,9 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		}
 		if restartKafka {
 			kafkaOps.RestartKafkaClusters(ctx, namespaces)
+		}
+		if restartPostgresql {
+			postgresqlOps.RestartPostgresqlClusters(ctx, namespaces)
 		}
 
 		return nil
@@ -383,6 +421,14 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		log.Info("Restarting Kafka clusters")
 		if err := kafkaOps.RestartKafkaClusters(ctx, namespaces); err != nil {
 			log.Warning("Failed to restart Kafka clusters: %v", err)
+		}
+	}
+
+	// Restart PostgreSQL clusters
+	if restartPostgresql {
+		log.Info("Restarting PostgreSQL clusters")
+		if err := postgresqlOps.RestartPostgresqlClusters(ctx, namespaces); err != nil {
+			return fmt.Errorf("failed to restart PostgreSQL clusters: %w", err)
 		}
 	}
 
