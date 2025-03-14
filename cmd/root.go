@@ -6,28 +6,32 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/k8s-rollout-restart/pkg/k8s"
-	"github.com/k8s-rollout-restart/pkg/logger"
-	"github.com/k8s-rollout-restart/pkg/operations"
-	"github.com/k8s-rollout-restart/pkg/reporter"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/uderik/k8s-rollout-restart/pkg/k8s"
+	"github.com/uderik/k8s-rollout-restart/pkg/logger"
+	"github.com/uderik/k8s-rollout-restart/pkg/operations"
+	"github.com/uderik/k8s-rollout-restart/pkg/reporter"
 )
 
 var (
-	cfgFile   string
-	dryRun    bool
-	execute   bool
-	ctxName   string
-	namespace string
-	parallel  int
-	timeout   int
-	output    string
-	noFlagger bool
-	doCordon  bool
+	cfgFile       string
+	dryRun        bool
+	execute       bool
+	ctxName       string
+	namespaces    []string
+	parallel      int
+	timeout       int
+	output        string
+	noFlagger     bool
+	doCordon      bool
+	resourceTypes []string
+	olderThan     string
 )
 
 // rootCmd represents the base command
@@ -54,12 +58,14 @@ func init() {
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Preview operations without execution")
 	rootCmd.Flags().BoolVarP(&execute, "execute", "e", false, "Execute operations")
 	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context")
-	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Kubernetes namespace")
+	rootCmd.Flags().StringSliceVarP(&namespaces, "namespace", "n", []string{}, "Kubernetes namespace(s). Multiple namespaces can be specified comma-separated.")
 	rootCmd.Flags().IntVarP(&parallel, "parallel", "p", 5, "Parallelism degree")
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 300, "Timeout in seconds")
 	rootCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text|json)")
 	rootCmd.Flags().BoolVar(&noFlagger, "no-flagger-filter", false, "Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)")
 	rootCmd.Flags().BoolVar(&doCordon, "cordon", false, "Whether to cordon nodes before restart (if not set, nodes will not be cordoned)")
+	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, all)")
+	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
@@ -103,10 +109,23 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
+	k8sClient := client.AsK8sClient()
+
+	// Parse olderThan parameter
+	var minAge *time.Duration
+	if olderThan != "" {
+		duration, err := parseDuration(olderThan)
+		if err != nil {
+			return fmt.Errorf("invalid older-than value: %v", err)
+		}
+		minAge = &duration
+	}
+
 	// Create operation handlers
-	clusterOps := operations.NewClusterOperations(client.Clientset(), parallel, timeout, noFlagger, dryRun)
-	deployOps := operations.NewDeploymentOperations(client.Clientset(), parallel, timeout, noFlagger, dryRun)
-	kafkaOps := operations.NewKafkaOperations(client.Clientset(), parallel, timeout, dryRun)
+	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, noFlagger, dryRun)
+	deployOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
+	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
+	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge)
 	rep := reporter.NewReporter(client.Clientset())
 
 	// Setup signal handling with rollback
@@ -134,9 +153,28 @@ func runRoot(cmd *cobra.Command, args []string) error {
 
 	// Generate initial report
 	log.Info("Generating initial cluster state report")
-	initialState, err := rep.GenerateReport(ctx, namespace)
+	initialState, err := rep.GenerateReport(ctx, namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate initial report: %w", err)
+	}
+
+	// Parse resource types to determine operations
+	var restartDeployments, restartStatefulSets, restartKafka bool
+	for _, resourceType := range resourceTypes {
+		switch resourceType {
+		case "deployments":
+			restartDeployments = true
+		case "statefulsets":
+			restartStatefulSets = true
+		case "strimzi-kafka":
+			restartKafka = true
+		case "all":
+			restartDeployments = true
+			restartStatefulSets = true
+			restartKafka = true
+		default:
+			return fmt.Errorf("invalid resource type: %s", resourceType)
+		}
 	}
 
 	if dryRun {
@@ -145,12 +183,14 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		log.Info("Nodes: %d (%d unschedulable)", len(initialState.Nodes), countUnschedulableNodes(initialState))
 
 		totalPods := 0
-		if namespace != "" {
-			if pods, exists := initialState.Pods[namespace]; exists {
-				totalPods = len(pods)
-				log.Info("Namespace %s: %d pods", namespace, totalPods)
-			} else {
-				log.Info("Namespace %s: not found or contains no pods", namespace)
+		if len(namespaces) > 0 {
+			for _, ns := range namespaces {
+				if pods, exists := initialState.Pods[ns]; exists {
+					totalPods += len(pods)
+					log.Info("Namespace %s: %d pods", ns, len(pods))
+				} else {
+					log.Info("Namespace %s: not found or contains no pods", ns)
+				}
 			}
 		} else {
 			for ns, pods := range initialState.Pods {
@@ -161,62 +201,122 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		log.Info("Total pods: %d", totalPods)
 
 		log.Info("\nComponents to be restarted:")
-		if namespace != "" {
-			log.Info("- Deployments in namespace %s will be restarted", namespace)
-			log.Info("- Kafka clusters in namespace %s will be restarted", namespace)
+		if len(namespaces) > 0 {
+			for _, ns := range namespaces {
+				if restartDeployments {
+					log.Info("- Deployments in namespace %s will be restarted", ns)
+				}
+				if restartStatefulSets {
+					log.Info("- StatefulSets in namespace %s will be restarted", ns)
+				}
+				if restartKafka {
+					log.Info("- Kafka clusters in namespace %s will be restarted", ns)
+				}
+			}
 		} else {
-			log.Info("- Deployments: %d", initialState.Components.Deployments)
-			log.Info("- StatefulSets: %d", initialState.Components.StatefulSets)
-			log.Info("- Kafka clusters: %d", initialState.Components.Kafka)
+			if restartDeployments {
+				log.Info("- Deployments: %d", initialState.Components.Deployments)
+			}
+			if restartStatefulSets {
+				log.Info("- StatefulSets: %d", initialState.Components.StatefulSets)
+			}
+			if restartKafka {
+				log.Info("- Kafka clusters: %d", initialState.Components.Kafka)
+			}
 		}
 
 		log.Info("\nOperations that would be performed:")
-		if namespace != "" {
+		if len(namespaces) > 0 {
 			if doCordon {
-				log.Info("1. Cordon nodes with pods from namespace: %s", namespace)
+				log.Info("1. Cordon nodes with pods from namespace: %s", namespaces[0])
 				operationNumber := 2
-				log.Info("%d. Restart all deployments in namespace: %s", operationNumber, namespace)
-				operationNumber++
-				log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespace)
-				operationNumber++
+				if restartDeployments {
+					log.Info("%d. Restart all deployments in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
+				if restartStatefulSets {
+					log.Info("%d. Restart all statefulsets in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
+				if restartKafka {
+					log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
 				log.Info("%d. Wait for all components to be ready", operationNumber)
 				operationNumber++
-				log.Info("%d. Uncordon nodes with pods from namespace: %s", operationNumber, namespace)
+				log.Info("%d. Uncordon nodes with pods from namespace: %s", operationNumber, namespaces[0])
 			} else {
-				log.Info("1. Restart all deployments in namespace: %s (without cordoning nodes)", namespace)
-				log.Info("2. Restart Kafka clusters in namespace: %s", namespace)
-				log.Info("3. Wait for all components to be ready")
+				operationNumber := 1
+				if restartDeployments {
+					log.Info("%d. Restart all deployments in namespace: %s (without cordoning nodes)", operationNumber, namespaces[0])
+					operationNumber++
+				}
+				if restartStatefulSets {
+					log.Info("%d. Restart all statefulsets in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
+				if restartKafka {
+					log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespaces[0])
+					operationNumber++
+				}
+				log.Info("%d. Wait for all components to be ready", operationNumber)
 			}
 		} else {
 			if doCordon {
 				log.Info("1. Cordon all nodes")
 				operationNumber := 2
-				log.Info("%d. Restart all deployments in all namespaces", operationNumber)
-				operationNumber++
-				log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
-				operationNumber++
+				if restartDeployments {
+					log.Info("%d. Restart all deployments in all namespaces", operationNumber)
+					operationNumber++
+				}
+				if restartStatefulSets {
+					log.Info("%d. Restart all statefulsets in all namespaces", operationNumber)
+					operationNumber++
+				}
+				if restartKafka {
+					log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
+					operationNumber++
+				}
 				log.Info("%d. Wait for all components to be ready", operationNumber)
 				operationNumber++
 				log.Info("%d. Uncordon all nodes", operationNumber)
 			} else {
-				log.Info("1. Restart all deployments in all namespaces (without cordoning nodes)")
-				log.Info("2. Restart Kafka clusters in all namespaces")
-				log.Info("3. Wait for all components to be ready")
+				operationNumber := 1
+				if restartDeployments {
+					log.Info("%d. Restart all deployments in all namespaces (without cordoning nodes)", operationNumber)
+					operationNumber++
+				}
+				if restartStatefulSets {
+					log.Info("%d. Restart all statefulsets in all namespaces", operationNumber)
+					operationNumber++
+				}
+				if restartKafka {
+					log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
+					operationNumber++
+				}
+				log.Info("%d. Wait for all components to be ready", operationNumber)
 			}
 		}
 
 		if !noFlagger {
-			log.Info("\nNote: Only Flagger primary deployments with Canary owner reference will be restarted")
+			log.Info("\nNote: For Flagger-managed deployments, only primary deployments will be restarted. Deployments without a primary counterpart will also be restarted.")
 		}
 
 		log.Info("\nParallel operations: %d", parallel)
 		log.Info("Operation timeout: %d seconds", timeout)
 
 		if doCordon {
-			clusterOps.CordonNodes(ctx, namespace)
+			clusterOps.CordonNodes(ctx, namespaces)
 		}
-		deployOps.RestartDeployments(ctx, namespace)
-		kafkaOps.RestartKafkaClusters(ctx, namespace)
+		if restartDeployments {
+			deployOps.RestartDeployments(ctx, namespaces)
+		}
+		if restartStatefulSets {
+			statefulSetOps.RestartStatefulSets(ctx, namespaces)
+		}
+		if restartKafka {
+			kafkaOps.RestartKafkaClusters(ctx, namespaces)
+		}
 
 		return nil
 	}
@@ -232,42 +332,63 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	// Cordon nodes - only if doCordon flag is set
 	if doCordon {
 		log.Info("Cordoning nodes")
-		if err := clusterOps.CordonNodes(ctx, namespace); err != nil {
+		if err := clusterOps.CordonNodes(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to cordon nodes: %w", err)
 		}
 
 		// Register rollback for cordon operation
 		if !dryRun {
-			rollbackMgr.AddRollbackOperation("Uncordon nodes", func(rollbackCtx context.Context) error {
-				return clusterOps.UncordonNodes(rollbackCtx, namespace)
+			rollbackMgr.RegisterRollback("Uncordon nodes", func(rollbackCtx context.Context) error {
+				return clusterOps.UncordonNodes(rollbackCtx, namespaces)
 			})
 		}
 	}
 
-	// Restart deployments
-	log.Info("Restarting deployments")
-	if err := deployOps.RestartDeployments(ctx, namespace); err != nil {
-		if doCordon && !dryRun {
-			// Rollback nodes that were cordoned if deployment restart fails
-			rollbackCtx, rollbackCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
-			defer rollbackCancel()
+	// Restart deployments if selected
+	if restartDeployments {
+		log.Info("Restarting deployments")
+		if err := deployOps.RestartDeployments(ctx, namespaces); err != nil {
+			if doCordon && !dryRun {
+				// Rollback nodes that were cordoned if deployment restart fails
+				rollbackCtx, rollbackCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
+				defer rollbackCancel()
 
-			if rollbackErr := rollbackMgr.Rollback(rollbackCtx); rollbackErr != nil {
-				log.Error("Rollback failed: %v", rollbackErr)
+				if rollbackErr := rollbackMgr.Rollback(rollbackCtx); rollbackErr != nil {
+					log.Error("Rollback failed: %v", rollbackErr)
+				}
 			}
+			return fmt.Errorf("failed to restart deployments: %w", err)
 		}
-		return fmt.Errorf("failed to restart deployments: %w", err)
+	}
+
+	// Restart statefulsets if selected
+	if restartStatefulSets {
+		log.Info("Restarting statefulsets")
+		if err := statefulSetOps.RestartStatefulSets(ctx, namespaces); err != nil {
+			if doCordon && !dryRun {
+				// Rollback nodes that were cordoned if statefulset restart fails
+				rollbackCtx, rollbackCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
+				defer rollbackCancel()
+
+				if rollbackErr := rollbackMgr.Rollback(rollbackCtx); rollbackErr != nil {
+					log.Error("Rollback failed: %v", rollbackErr)
+				}
+			}
+			return fmt.Errorf("failed to restart statefulsets: %w", err)
+		}
 	}
 
 	// Restart Kafka clusters
-	log.Info("Restarting Kafka clusters")
-	if err := kafkaOps.RestartKafkaClusters(ctx, namespace); err != nil {
-		log.Warning("Failed to restart Kafka clusters: %v", err)
+	if restartKafka {
+		log.Info("Restarting Kafka clusters")
+		if err := kafkaOps.RestartKafkaClusters(ctx, namespaces); err != nil {
+			log.Warning("Failed to restart Kafka clusters: %v", err)
+		}
 	}
 
 	// Generate final report
 	log.Info("Generating final cluster state report")
-	finalState, err := rep.GenerateReport(ctx, namespace)
+	finalState, err := rep.GenerateReport(ctx, namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate final report: %w", err)
 	}
@@ -283,7 +404,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	// Execute rollback to uncordon nodes if needed
 	if doCordon && !dryRun {
 		log.Info("Uncordoning nodes")
-		if err := clusterOps.UncordonNodes(ctx, namespace); err != nil {
+		if err := clusterOps.UncordonNodes(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to uncordon nodes: %w", err)
 		}
 		// Clear rollback operations since we manually performed the uncordon
@@ -303,4 +424,27 @@ func countUnschedulableNodes(state *reporter.ClusterState) int {
 		}
 	}
 	return count
+}
+
+// parseDuration extends the standard time.ParseDuration to support days
+func parseDuration(durationStr string) (time.Duration, error) {
+	// Check for day format (e.g., "7d")
+	if strings.Contains(durationStr, "d") {
+		parts := strings.Split(durationStr, "d")
+		if len(parts) != 2 {
+			return 0, fmt.Errorf("invalid day format in duration: %s", durationStr)
+		}
+
+		days, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return 0, fmt.Errorf("invalid number of days: %s", parts[0])
+		}
+
+		// Convert days to hours and parse the rest normally
+		hoursStr := fmt.Sprintf("%dh%s", days*24, parts[1])
+		return time.ParseDuration(hoursStr)
+	}
+
+	// Standard duration parsing
+	return time.ParseDuration(durationStr)
 }

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/k8s-rollout-restart/pkg/logger"
+	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	"k8s.io/client-go/kubernetes"
 )
 

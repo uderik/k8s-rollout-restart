@@ -56,139 +56,98 @@ func NewReporter(client *kubernetes.Clientset) *Reporter {
 }
 
 // GenerateReport generates a report of the current cluster state
-// If namespace is not empty, report will include only information about that namespace
-func (r *Reporter) GenerateReport(ctx context.Context, namespace string) (*ClusterState, error) {
-	state := &ClusterState{
+// If namespaces is empty, report on all namespaces
+func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*ClusterState, error) {
+	report := &ClusterState{
 		Timestamp: time.Now().Format(time.RFC3339),
 		Pods:      make(map[string][]PodState),
 	}
 
-	// Get nodes state
+	// Get all nodes
 	nodes, err := r.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list nodes: %w", err)
 	}
 
+	// Process node info
 	for _, node := range nodes.Items {
-		nodeState := NodeState{
+		nodeInfo := NodeState{
 			Name:          node.Name,
 			Status:        getNodeStatus(&node),
 			Unschedulable: node.Spec.Unschedulable,
 		}
-		state.Nodes = append(state.Nodes, nodeState)
+		report.Nodes = append(report.Nodes, nodeInfo)
 	}
 
-	// Get pods state for each namespace
-	if namespace != "" {
-		// If namespace specified, get pods only for that namespace
-		if err := r.collectNamespacePods(ctx, namespace, state.Pods); err != nil {
-			return nil, err
-		}
-	} else {
-		// Get all namespaces
-		namespaces, err := r.client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	// If no namespaces provided, get all namespaces
+	namespacesToCheck := namespaces
+	if len(namespacesToCheck) == 0 {
+		nsList, err := r.client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to list namespaces: %w", err)
 		}
 
-		for _, ns := range namespaces.Items {
-			if err := r.collectNamespacePods(ctx, ns.Name, state.Pods); err != nil {
-				return nil, err
+		for _, ns := range nsList.Items {
+			namespacesToCheck = append(namespacesToCheck, ns.Name)
+		}
+	}
+
+	// For each namespace, get pods and other resources
+	for _, ns := range namespacesToCheck {
+		// Get pods in namespace
+		pods, err := r.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list pods in namespace %s: %w", ns, err)
+		}
+
+		// Process pod info for this namespace
+		var podInfos []PodState
+		for _, pod := range pods.Items {
+			podInfo := PodState{
+				Name:     pod.Name,
+				Status:   string(pod.Status.Phase),
+				Ready:    isPodReady(&pod),
+				Restarts: getTotalRestarts(&pod),
+				Age:      time.Since(pod.CreationTimestamp.Time).Round(time.Second).String(),
 			}
+			podInfos = append(podInfos, podInfo)
 		}
-	}
+		report.Pods[ns] = podInfos
 
-	// Get component counts
-	if err := r.collectComponentCounts(ctx, &state.Components, namespace); err != nil {
-		return nil, err
-	}
-
-	return state, nil
-}
-
-// collectNamespacePods collects pod information for a specific namespace
-func (r *Reporter) collectNamespacePods(ctx context.Context, namespace string, podMap map[string][]PodState) error {
-	pods, err := r.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
-	}
-
-	var podStates []PodState
-	for _, pod := range pods.Items {
-		podState := PodState{
-			Name:     pod.Name,
-			Status:   string(pod.Status.Phase),
-			Ready:    isPodReady(&pod),
-			Restarts: getTotalRestarts(&pod),
-			Age:      time.Since(pod.CreationTimestamp.Time).Round(time.Second).String(),
+		// Count components in this namespace
+		deployments, err := r.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
 		}
-		podStates = append(podStates, podState)
-	}
-	podMap[namespace] = podStates
+		report.Components.Deployments += len(deployments.Items)
 
-	return nil
-}
+		statefulsets, err := r.client.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list statefulsets in namespace %s: %w", ns, err)
+		}
+		report.Components.StatefulSets += len(statefulsets.Items)
 
-// collectComponentCounts collects counts of different component types, optionally filtered by namespace
-func (r *Reporter) collectComponentCounts(ctx context.Context, state *ComponentState, namespace string) error {
-	// Get deployments
-	deployments, err := r.client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list deployments: %w", err)
-	}
-	state.Deployments = len(deployments.Items)
-
-	// Get statefulsets
-	statefulSets, err := r.client.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list statefulsets: %w", err)
-	}
-	state.StatefulSets = len(statefulSets.Items)
-
-	// Get daemonsets
-	daemonSets, err := r.client.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list daemonsets: %w", err)
-	}
-	state.DaemonSets = len(daemonSets.Items)
-
-	// Count Kafka clusters using the REST client
-	kafkaPath := "/apis/kafka.strimzi.io/v1beta2"
-	if namespace != "" {
-		response, err := r.client.RESTClient().
-			Get().
-			AbsPath(kafkaPath).
-			Namespace(namespace).
+		// Count Kafka resources if available
+		kafkaList, err := r.client.RESTClient().Get().
+			AbsPath("/apis/kafka.strimzi.io/v1beta2").
+			Namespace(ns).
 			Resource("kafkas").
-			Do(ctx).
-			Raw()
-		if err == nil && len(response) > 0 {
+			DoRaw(ctx)
+		if err == nil {
 			var result struct {
-				Items []interface{} `json:"items"`
+				Items []struct {
+					Metadata struct {
+						Name string `json:"name"`
+					} `json:"metadata"`
+				} `json:"items"`
 			}
-			if err := json.Unmarshal(response, &result); err == nil {
-				state.Kafka = len(result.Items)
-			}
-		}
-	} else {
-		// Try to count all Kafka clusters in all namespaces
-		response, err := r.client.RESTClient().
-			Get().
-			AbsPath(kafkaPath).
-			Resource("kafkas").
-			Do(ctx).
-			Raw()
-		if err == nil && len(response) > 0 {
-			var result struct {
-				Items []interface{} `json:"items"`
-			}
-			if err := json.Unmarshal(response, &result); err == nil {
-				state.Kafka = len(result.Items)
+			if err := json.Unmarshal(kafkaList, &result); err == nil {
+				report.Components.Kafka += len(result.Items)
 			}
 		}
 	}
 
-	return nil
+	return report, nil
 }
 
 // ToJSON converts the cluster state to JSON format
