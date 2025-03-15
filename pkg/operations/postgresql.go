@@ -43,31 +43,8 @@ func NewPostgresqlOperations(clientset K8sClient, parallel, timeout int, dryRun 
 // RestartPostgresqlClusters restarts all PostgreSQL clusters in the given namespaces
 func (p *PostgresqlOperations) RestartPostgresqlClusters(ctx context.Context, namespaces []string) error {
 	if len(namespaces) == 0 {
-		p.log.Info("No namespaces specified, will restart PostgreSQL clusters in all namespaces")
-		// Используем прямой запрос к API вместо p.clientset.CoreV1().Namespaces().List()
-		// Получаем все пространства имен через REST API
-		nsList, err := p.clientset.RESTClient().Get().
-			AbsPath("/api/v1/namespaces").
-			DoRaw(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to list namespaces: %w", err)
-		}
-
-		var namespaceList struct {
-			Items []struct {
-				Metadata struct {
-					Name string `json:"name"`
-				} `json:"metadata"`
-			} `json:"items"`
-		}
-
-		if err := json.Unmarshal(nsList, &namespaceList); err != nil {
-			return fmt.Errorf("failed to parse namespaces: %w", err)
-		}
-
-		for _, ns := range namespaceList.Items {
-			namespaces = append(namespaces, ns.Metadata.Name)
-		}
+		p.log.Info("No namespaces specified, skipping PostgreSQL clusters restart")
+		return nil
 	}
 
 	p.log.Info("Starting PostgreSQL clusters restart in %d namespace(s)", len(namespaces))
@@ -79,12 +56,15 @@ func (p *PostgresqlOperations) RestartPostgresqlClusters(ctx context.Context, na
 	// Channel to track if any PostgreSQL clusters were actually restarted
 	clusterFoundCh := make(chan bool, len(namespaces))
 
+	// Add a channel to track namespaces without PostgreSQL clusters
+	emptyNamespacesCh := make(chan string, len(namespaces))
+
 	for _, ns := range namespaces {
 		ns := ns // Capture for goroutine
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			found, err := p.restartPostgresqlClustersInNamespace(ctx, ns)
+			found, err := p.restartPostgresqlClustersInNamespace(ctx, ns, emptyNamespacesCh)
 
 			// Signal if PostgreSQL clusters were found
 			clusterFoundCh <- found
@@ -99,6 +79,7 @@ func (p *PostgresqlOperations) RestartPostgresqlClusters(ctx context.Context, na
 	wg.Wait()
 	close(errorCh)
 	close(clusterFoundCh)
+	close(emptyNamespacesCh)
 
 	// Check if any PostgreSQL clusters were actually found and restarted
 	postgresqlClustersFound := false
@@ -107,6 +88,16 @@ func (p *PostgresqlOperations) RestartPostgresqlClusters(ctx context.Context, na
 			postgresqlClustersFound = true
 			break
 		}
+	}
+
+	// Collect names of empty namespaces
+	emptyNamespaces := make([]string, 0)
+	for ns := range emptyNamespacesCh {
+		emptyNamespaces = append(emptyNamespaces, ns)
+	}
+
+	if len(emptyNamespaces) > 0 && p.dryRun {
+		p.log.Info("PostgreSQL clusters not found in %d namespaces (skipped)", len(emptyNamespaces))
 	}
 
 	// Check for errors
@@ -131,14 +122,19 @@ func (p *PostgresqlOperations) RestartPostgresqlClusters(ctx context.Context, na
 
 // restartPostgresqlClustersInNamespace restarts all PostgreSQL clusters in a single namespace
 // Returns a boolean indicating if any PostgreSQL clusters were found and restarted, and an error if any
-func (p *PostgresqlOperations) restartPostgresqlClustersInNamespace(ctx context.Context, namespace string) (bool, error) {
-	p.log.Info("Checking for PostgreSQL clusters in namespace %s", namespace)
+func (p *PostgresqlOperations) restartPostgresqlClustersInNamespace(ctx context.Context, namespace string, emptyNamespacesCh chan<- string) (bool, error) {
+	// Only log the check message if not in dry-run mode
+	if !p.dryRun {
+		p.log.Info("Checking for PostgreSQL clusters in namespace %s", namespace)
+	}
 
 	// Check if PostgreSQL CRD exists
 	_, err := p.clientset.RESTClient().Get().AbsPath("/apis/acid.zalan.do/v1").DoRaw(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			p.log.Info("PostgreSQL CRD not found, skipping PostgreSQL operations")
+			if !p.dryRun {
+				p.log.Info("PostgreSQL CRD not found, skipping PostgreSQL operations")
+			}
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check for PostgreSQL CRD: %w", err)
@@ -152,7 +148,8 @@ func (p *PostgresqlOperations) restartPostgresqlClustersInNamespace(ctx context.
 		DoRaw(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			p.log.Info("No PostgreSQL clusters found in namespace %s, skipping", namespace)
+			// Send the namespace name to the channel for counting
+			emptyNamespacesCh <- namespace
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to list PostgreSQL clusters in namespace %s: %w", namespace, err)
@@ -173,7 +170,8 @@ func (p *PostgresqlOperations) restartPostgresqlClustersInNamespace(ctx context.
 	}
 
 	if len(postgresClusters.Items) == 0 {
-		p.log.Info("No PostgreSQL clusters found in namespace %s, skipping", namespace)
+		// Send the namespace name to the channel for counting
+		emptyNamespacesCh <- namespace
 		return false, nil
 	}
 

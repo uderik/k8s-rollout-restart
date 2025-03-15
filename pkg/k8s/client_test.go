@@ -12,7 +12,7 @@ func TestK8sClientAdapterInterfaces(t *testing.T) {
 	t.Skip("This test requires Kubernetes configuration")
 
 	// This test would verify that NewClient correctly initializes and returns a Client
-	client, err := NewClient("")
+	client, err := NewClient("", 50, 300)
 	assert.NoError(t, err)
 	assert.NotNil(t, client)
 
