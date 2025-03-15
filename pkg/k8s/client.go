@@ -23,7 +23,7 @@ type Client struct {
 }
 
 // NewClient creates a new Kubernetes client
-func NewClient(context string) (*Client, error) {
+func NewClient(context string, qps float32, burst int) (*Client, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
 
@@ -36,6 +36,10 @@ func NewClient(context string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load Kubernetes config: %w", err)
 	}
+
+	// Set the QPS and Burst limits for the client
+	config.QPS = qps
+	config.Burst = burst
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -95,6 +99,10 @@ func (a *coreV1Adapter) Nodes() operations.NodeInterface {
 	return &nodeAdapter{nodes: a.coreV1.Nodes()}
 }
 
+func (a *coreV1Adapter) Namespaces() operations.NamespaceInterface {
+	return &namespaceAdapter{namespaces: a.coreV1.Namespaces()}
+}
+
 // podAdapter adapts a pod client to operations.PodInterface
 type podAdapter struct {
 	pods typedcorev1.PodInterface
@@ -115,6 +123,16 @@ func (a *nodeAdapter) List(ctx context.Context, opts metav1.ListOptions) (*corev
 
 func (a *nodeAdapter) Update(ctx context.Context, node *corev1.Node, opts metav1.UpdateOptions) (*corev1.Node, error) {
 	return a.nodes.Update(ctx, node, opts)
+}
+
+// Add namespace adapter
+// namespaceAdapter adapts a namespace client to operations.NamespaceInterface
+type namespaceAdapter struct {
+	namespaces typedcorev1.NamespaceInterface
+}
+
+func (a *namespaceAdapter) List(ctx context.Context, opts metav1.ListOptions) (*corev1.NamespaceList, error) {
+	return a.namespaces.List(ctx, opts)
 }
 
 // appsV1Adapter adapts an AppsV1Client to operations.AppsV1Interface

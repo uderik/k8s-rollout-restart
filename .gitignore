@@ -5,6 +5,7 @@
 *.so
 *.dylib
 k8s-rollout-restart
+restricted-kubeconfig.yaml
 
 # Test binary, built with `go test -c`
 *.test

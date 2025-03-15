@@ -56,6 +56,9 @@ type CoreV1Interface interface {
 
 	// Nodes returns the node client
 	Nodes() NodeInterface
+
+	// Namespaces returns the namespace client
+	Namespaces() NamespaceInterface
 }
 
 // AppsV1Interface defines the interface for apps resources
@@ -110,4 +113,10 @@ type StatefulSetInterface interface {
 
 	// Patch applies the patch to the statefulset with the given name
 	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*appsv1.StatefulSet, error)
+}
+
+// NamespaceInterface defines operations on namespaces
+type NamespaceInterface interface {
+	// List lists all namespaces
+	List(ctx context.Context, opts metav1.ListOptions) (*corev1.NamespaceList, error)
 }

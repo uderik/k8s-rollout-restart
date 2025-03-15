@@ -46,7 +46,7 @@ metadata:
   name: k8s-rollout-restart
 rules:
 - apiGroups: [""]
-  resources: ["nodes", "pods"]
+  resources: ["nodes", "pods", "namespaces"]
   verbs: ["get", "list", "watch", "patch"]
 - apiGroups: ["apps"]
   resources: ["deployments", "statefulsets"]
@@ -61,6 +61,8 @@ rules:
   resources: ["postgresqls"]
   verbs: ["get", "list", "watch", "patch"]
 ```
+
+> **Important**: The `"namespaces"` resource permission with `"list"` verb is required at the cluster scope when running in "all namespaces" mode, especially for PostgreSQL cluster operations.
 
 You can apply this role to a specific service account using a RoleBinding (namespace-specific) or ClusterRoleBinding (cluster-wide):
 
@@ -79,6 +81,8 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
+> **Note**: For restricted environments, make sure the service account has at least access to list namespaces or ensure you explicitly specify target namespaces with the `--namespace` flag.
+
 ## Usage
 
 ```bash
@@ -93,6 +97,9 @@ k8s-rollout-restart --execute --context=production-cluster
 
 # Limit to namespace
 k8s-rollout-restart --execute --namespace=app-namespace
+
+# Process resources across all namespaces
+k8s-rollout-restart --execute --all-namespaces
 
 # Configure parallel processing
 k8s-rollout-restart --execute --parallel=10 --timeout=600
@@ -116,6 +123,9 @@ k8s-rollout-restart --execute --resources=zalando-postgresql
 k8s-rollout-restart --execute --resources=deployments,statefulsets
 # or restart all types of resources
 k8s-rollout-restart --execute --resources=all
+
+# Restart all types of resources across all namespaces
+k8s-rollout-restart --execute --resources=all --all-namespaces
 
 # Restart only resources older than 7 days
 k8s-rollout-restart --execute --older-than=7d
@@ -191,6 +201,7 @@ go test -tags=integration ./...
   -e, --execute               Execute operations
   -c, --context string        Kubernetes context
   -n, --namespace strings     Namespaces to target (comma-separated, empty for all namespaces)
+  -A, --all-namespaces        Process resources across all namespaces
   -p, --parallel int          Parallelism degree (default: 5)
   -t, --timeout int           Timeout in seconds (default: 300)
   -o, --output string         Output format (text|json) (default: text)
@@ -198,6 +209,8 @@ go test -tags=integration ./...
   --no-flagger-filter         Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)
   --cordon                    Enable node cordoning
   --older-than string         Restart only resources older than specified duration (e.g. 24h, 30m, 7d)
+  --kube-api-qps float32      The maximum queries-per-second of requests sent to the Kubernetes API (default: 50)
+  --kube-api-burst int        The maximum burst queries-per-second of requests sent to the Kubernetes API (default: 300)
   -h, --help                  Help
 ```
 

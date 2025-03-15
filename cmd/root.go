@@ -17,6 +17,7 @@ import (
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	"github.com/uderik/k8s-rollout-restart/pkg/operations"
 	"github.com/uderik/k8s-rollout-restart/pkg/reporter"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -25,6 +26,7 @@ var (
 	execute       bool
 	ctxName       string
 	namespaces    []string
+	allNamespaces bool
 	parallel      int
 	timeout       int
 	output        string
@@ -32,21 +34,25 @@ var (
 	doCordon      bool
 	resourceTypes []string
 	olderThan     string
+	kubeAPIQPS    float32
+	kubeAPIBurst  int
 )
 
-// rootCmd represents the base command
+// rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "k8s-rollout-restart",
 	Short: "Kubernetes cluster maintenance automation utility",
-	Long: `Kubernetes cluster maintenance automation utility.
-Performs component restart with dependency handling and state verification.
-
-Kubernetes cluster maintenance automation utility.
-Performs component restart with dependency handling and state verification.`,
+	Long: `A utility for automating Kubernetes cluster maintenance process, including:
+- Temporary marking nodes as unschedulable (cordon)
+- Restarting all components (Deployments, StatefulSets)
+- Restarting Kafka clusters managed by Strimzi operator
+- Verification of successful restart of all services
+- Generating cluster state report`,
 	RunE: runRoot,
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately
+// Execute adds all child commands to the root command and sets flags appropriately.
+// This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() error {
 	return rootCmd.Execute()
 }
@@ -59,6 +65,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&execute, "execute", "e", false, "Execute operations")
 	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context")
 	rootCmd.Flags().StringSliceVarP(&namespaces, "namespace", "n", []string{}, "Kubernetes namespace(s). Multiple namespaces can be specified comma-separated.")
+	rootCmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Process resources across all namespaces")
 	rootCmd.Flags().IntVarP(&parallel, "parallel", "p", 5, "Parallelism degree")
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 300, "Timeout in seconds")
 	rootCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text|json)")
@@ -66,9 +73,14 @@ func init() {
 	rootCmd.Flags().BoolVar(&doCordon, "cordon", false, "Whether to cordon nodes before restart (if not set, nodes will not be cordoned)")
 	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all)")
 	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
+	rootCmd.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 50, "The maximum queries-per-second of requests sent to the Kubernetes API")
+	rootCmd.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 300, "The maximum burst queries-per-second of requests sent to the Kubernetes API")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
+
+	// Mark namespace and all-namespaces as mutually exclusive
+	rootCmd.MarkFlagsMutuallyExclusive("namespace", "all-namespaces")
 }
 
 func initConfig() {
@@ -135,12 +147,27 @@ func runRoot(cmd *cobra.Command, args []string) error {
 
 	// Initialize Kubernetes client
 	log.Info("Initializing Kubernetes client")
-	client, err := k8s.NewClient(ctxName)
+	client, err := k8s.NewClient(ctxName, kubeAPIQPS, kubeAPIBurst)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
 	k8sClient := client.AsK8sClient()
+
+	// If all-namespaces flag is set, get all namespaces
+	if allNamespaces {
+		log.Info("Getting all namespaces")
+		nsList, err := k8sClient.CoreV1().Namespaces().List(stdcontext.Background(), metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to list namespaces: %w", err)
+		}
+
+		namespaces = []string{}
+		for _, ns := range nsList.Items {
+			namespaces = append(namespaces, ns.Name)
+		}
+		log.Info("Found %d namespaces", len(namespaces))
+	}
 
 	// Parse olderThan parameter
 	var minAge *time.Duration
