@@ -34,10 +34,10 @@ func NewClusterOperations(clientset K8sClient, parallel, timeout int, noFlagger,
 	}
 }
 
-// CordonNodes cordons all nodes with pods from the namespaces
-func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string) error {
-	if len(namespaces) == 0 {
-		c.log.Info("No namespaces specified, skipping node cordon")
+// CordonNodes cordons all nodes with pods from the namespaces or all nodes if cordonAllNodes is true
+func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string, cordonAllNodes bool) error {
+	if len(namespaces) == 0 && !cordonAllNodes {
+		c.log.Info("No namespaces specified and cordon-all-nodes not set, skipping node cordon")
 		return nil
 	}
 
@@ -50,26 +50,34 @@ func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string
 	// Map for node names to check
 	nodeNames := make(map[string]bool)
 
-	// For each namespace, find nodes with pods
-	for _, namespace := range namespaces {
-		// Get all pods in the namespace
-		pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+	if cordonAllNodes {
+		// Add all nodes to the map if cordonAllNodes is true
+		c.log.Info("Cordoning all nodes in the cluster as requested")
+		for _, node := range nodes.Items {
+			nodeNames[node.Name] = true
 		}
+	} else {
+		// For each namespace, find nodes with pods
+		for _, namespace := range namespaces {
+			// Get all pods in the namespace
+			pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+			}
 
-		// Find nodes with pods from the namespace
-		for _, pod := range pods.Items {
-			nodeNames[pod.Spec.NodeName] = true
+			// Find nodes with pods from the namespace
+			for _, pod := range pods.Items {
+				nodeNames[pod.Spec.NodeName] = true
+			}
 		}
 	}
 
 	if len(nodeNames) == 0 {
-		c.log.Warning("No nodes found with pods from specified namespaces, skipping cordon")
+		c.log.Warning("No nodes found to cordon, skipping cordon operation")
 		return nil
 	}
 
-	c.log.Info("Found %d nodes with pods from specified namespaces", len(nodeNames))
+	c.log.Info("Found %d nodes to cordon", len(nodeNames))
 
 	if c.dryRun {
 		c.log.Info("Would cordon the following nodes:")

@@ -86,13 +86,13 @@ roleRef:
 ## Usage
 
 ```bash
-# Preview operations without execution
+# Preview operations (dry-run mode)
 k8s-rollout-restart --dry-run
 
 # Execute operations
 k8s-rollout-restart --execute
 
-# Use specific context
+# Use specific Kubernetes context
 k8s-rollout-restart --execute --context=production-cluster
 
 # Limit to namespace
@@ -104,28 +104,26 @@ k8s-rollout-restart --execute --all-namespaces
 # Configure parallel processing
 k8s-rollout-restart --execute --parallel=10 --timeout=600
 
-# Enable node cordoning
+# Enable node cordoning (only nodes with pods in target namespaces)
 k8s-rollout-restart --execute --cordon
 
-# Output logs in JSON format
-k8s-rollout-restart --execute --output=json
+# Enable cordoning of all nodes in the cluster
+k8s-rollout-restart --execute --cordon --cordon-all-nodes
 
-# Restart only StatefulSets
+# JSON output
+k8s-rollout-restart --dry-run --output=json
+
+# Restart specific resource types
+k8s-rollout-restart --execute --resources=deployments
 k8s-rollout-restart --execute --resources=statefulsets
-
-# Restart only Kafka clusters managed by Strimzi
 k8s-rollout-restart --execute --resources=strimzi-kafka
-
-# Restart only PostgreSQL clusters managed by Zalando PostgreSQL Operator
 k8s-rollout-restart --execute --resources=zalando-postgresql
 
-# Restart both Deployments and StatefulSets
+# Restart multiple resource types
 k8s-rollout-restart --execute --resources=deployments,statefulsets
+
 # or restart all types of resources
 k8s-rollout-restart --execute --resources=all
-
-# Restart all types of resources across all namespaces
-k8s-rollout-restart --execute --resources=all --all-namespaces
 
 # Restart only resources older than 7 days
 k8s-rollout-restart --execute --older-than=7d
@@ -208,6 +206,7 @@ go test -tags=integration ./...
   --resources strings         Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all) (default: deployments)
   --no-flagger-filter         Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)
   --cordon                    Enable node cordoning
+  --cordon-all-nodes          Cordon all nodes in the cluster, not just those with pods from specified namespaces
   --older-than string         Restart only resources older than specified duration (e.g. 24h, 30m, 7d)
   --kube-api-qps float32      The maximum queries-per-second of requests sent to the Kubernetes API (default: 50)
   --kube-api-burst int        The maximum burst queries-per-second of requests sent to the Kubernetes API (default: 300)

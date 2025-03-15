@@ -30,8 +30,8 @@ type StatefulSetOperator interface {
 
 // ClusterOperator defines the interface for cluster operations
 type ClusterOperator interface {
-	// CordonNodes cordons all nodes with pods from the namespaces
-	CordonNodes(ctx context.Context, namespaces []string) error
+	// CordonNodes cordons all nodes with pods from the namespaces or all nodes if cordonAllNodes is true
+	CordonNodes(ctx context.Context, namespaces []string, cordonAllNodes bool) error
 
 	// UncordonNodes uncordons all nodes previously cordoned
 	UncordonNodes(ctx context.Context, namespaces []string) error

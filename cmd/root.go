@@ -21,21 +21,22 @@ import (
 )
 
 var (
-	cfgFile       string
-	dryRun        bool
-	execute       bool
-	ctxName       string
-	namespaces    []string
-	allNamespaces bool
-	parallel      int
-	timeout       int
-	output        string
-	noFlagger     bool
-	doCordon      bool
-	resourceTypes []string
-	olderThan     string
-	kubeAPIQPS    float32
-	kubeAPIBurst  int
+	cfgFile        string
+	dryRun         bool
+	execute        bool
+	ctxName        string
+	namespaces     []string
+	allNamespaces  bool
+	parallel       int
+	timeout        int
+	output         string
+	noFlagger      bool
+	doCordon       bool
+	cordonAllNodes bool
+	resourceTypes  []string
+	olderThan      string
+	kubeAPIQPS     float32
+	kubeAPIBurst   int
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -71,6 +72,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text|json)")
 	rootCmd.Flags().BoolVar(&noFlagger, "no-flagger-filter", false, "Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)")
 	rootCmd.Flags().BoolVar(&doCordon, "cordon", false, "Whether to cordon nodes before restart (if not set, nodes will not be cordoned)")
+	rootCmd.Flags().BoolVar(&cordonAllNodes, "cordon-all-nodes", false, "Cordon all nodes in the cluster, not just those with pods from specified namespaces")
 	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all)")
 	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
 	rootCmd.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 50, "The maximum queries-per-second of requests sent to the Kubernetes API")
@@ -368,7 +370,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		log.Info("Operation timeout: %d seconds", timeout)
 
 		if doCordon {
-			clusterOps.CordonNodes(ctx, namespaces)
+			clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes)
 		}
 		if restartDeployments {
 			deployOps.RestartDeployments(ctx, namespaces)
@@ -397,7 +399,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	// Cordon nodes - only if doCordon flag is set
 	if doCordon {
 		log.Info("Cordoning nodes")
-		if err := clusterOps.CordonNodes(ctx, namespaces); err != nil {
+		if err := clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes); err != nil {
 			return fmt.Errorf("failed to cordon nodes: %w", err)
 		}
 

@@ -10,13 +10,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// MockClusterOperator is a mock for ClusterOperator interface
+// MockClusterOperator is a mock implementation of ClusterOperator
 type MockClusterOperator struct {
 	mock.Mock
 }
 
-func (m *MockClusterOperator) CordonNodes(ctx context.Context, namespaces []string) error {
-	args := m.Called(ctx, namespaces)
+func (m *MockClusterOperator) CordonNodes(ctx context.Context, namespaces []string, cordonAllNodes bool) error {
+	args := m.Called(ctx, namespaces, cordonAllNodes)
 	return args.Error(0)
 }
 
@@ -25,29 +25,32 @@ func (m *MockClusterOperator) UncordonNodes(ctx context.Context, namespaces []st
 	return args.Error(0)
 }
 
-func TestClusterOperator_Mock(t *testing.T) {
-	// Create a mock
+// TestMockClusterOperator tests the mock implementation
+func TestMockClusterOperator(t *testing.T) {
 	mockOp := new(MockClusterOperator)
 
 	// Set up expectations for CordonNodes
-	mockOp.On("CordonNodes", mock.Anything, []string{"test-namespace"}).Return(nil)
+	mockOp.On("CordonNodes", mock.Anything, []string{"test-namespace"}, false).Return(nil)
 
-	// Call the method
-	err := mockOp.CordonNodes(context.Background(), []string{"test-namespace"})
-
-	// Assert expectations
+	// Call CordonNodes and check result
+	err := mockOp.CordonNodes(context.Background(), []string{"test-namespace"}, false)
 	assert.NoError(t, err)
-	mockOp.AssertExpectations(t)
+
+	// Set up expectations for CordonNodes with cordonAllNodes=true
+	mockOp.On("CordonNodes", mock.Anything, []string{}, true).Return(nil)
+
+	// Call CordonNodes with cordonAllNodes=true and check result
+	err = mockOp.CordonNodes(context.Background(), []string{}, true)
+	assert.NoError(t, err)
 
 	// Reset and set up expectations for UncordonNodes
-	mockOp = new(MockClusterOperator)
 	mockOp.On("UncordonNodes", mock.Anything, []string{"test-namespace"}).Return(nil)
 
-	// Call the method
+	// Call UncordonNodes and check result
 	err = mockOp.UncordonNodes(context.Background(), []string{"test-namespace"})
-
-	// Assert expectations
 	assert.NoError(t, err)
+
+	// Verify all expectations were met
 	mockOp.AssertExpectations(t)
 }
 
