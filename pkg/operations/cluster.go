@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
@@ -35,7 +36,7 @@ func NewClusterOperations(clientset K8sClient, parallel, timeout int, noFlagger,
 }
 
 // CordonNodes cordons all nodes with pods from the namespaces or all nodes if cordonAllNodes is true
-func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string, cordonAllNodes bool) error {
+func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string, cordonAllNodes bool, nodeLabels []string, excludeLabels []string) error {
 	if len(namespaces) == 0 && !cordonAllNodes {
 		c.log.Info("No namespaces specified and cordon-all-nodes not set, skipping node cordon")
 		return nil
@@ -77,11 +78,74 @@ func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string
 		return nil
 	}
 
-	c.log.Info("Found %d nodes to cordon", len(nodeNames))
+	// Parse node labels
+	requiredLabels := make(map[string]string)
+	for _, label := range nodeLabels {
+		parts := strings.Split(label, "=")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid node label format: %s (expected key=value)", label)
+		}
+		requiredLabels[parts[0]] = parts[1]
+	}
+
+	// Parse exclude labels
+	excludedLabels := make(map[string]string)
+	for _, label := range excludeLabels {
+		parts := strings.Split(label, "=")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid exclude label format: %s (expected key=value)", label)
+		}
+		excludedLabels[parts[0]] = parts[1]
+	}
+
+	// Filter nodes by labels
+	filteredNodes := make(map[string]bool)
+	for nodeName := range nodeNames {
+		node, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("metadata.name=%s", nodeName),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+		}
+
+		if len(node.Items) == 0 {
+			continue
+		}
+
+		nodeObj := node.Items[0]
+		shouldInclude := true
+
+		// Check required labels
+		for key, value := range requiredLabels {
+			if nodeObj.Labels[key] != value {
+				shouldInclude = false
+				break
+			}
+		}
+
+		// Check excluded labels
+		for key, value := range excludedLabels {
+			if nodeObj.Labels[key] == value {
+				shouldInclude = false
+				break
+			}
+		}
+
+		if shouldInclude {
+			filteredNodes[nodeName] = true
+		}
+	}
+
+	if len(filteredNodes) == 0 {
+		c.log.Warning("No nodes found after label filtering, skipping cordon operation")
+		return nil
+	}
+
+	c.log.Info("Found %d nodes to cordon after label filtering", len(filteredNodes))
 
 	if c.dryRun {
 		c.log.Info("Would cordon the following nodes:")
-		for node := range nodeNames {
+		for node := range filteredNodes {
 			c.log.Info("- %s", node)
 		}
 		return nil
@@ -106,7 +170,7 @@ func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string
 	}
 
 	// Send nodes to cordon
-	for nodeName := range nodeNames {
+	for nodeName := range filteredNodes {
 		ch <- nodeName
 	}
 	close(ch)

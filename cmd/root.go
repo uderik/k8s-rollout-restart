@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	stdcontext "context"
 	"fmt"
 	"os"
@@ -27,6 +26,7 @@ var (
 	ctxName        string
 	namespaces     []string
 	allNamespaces  bool
+	ignoreNS       []string
 	parallel       int
 	timeout        int
 	output         string
@@ -37,6 +37,8 @@ var (
 	olderThan      string
 	kubeAPIQPS     float32
 	kubeAPIBurst   int
+	nodeLabels     []string
+	excludeLabels  []string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -48,14 +50,29 @@ var rootCmd = &cobra.Command{
 - Restarting all components (Deployments, StatefulSets)
 - Restarting Kafka clusters managed by Strimzi operator
 - Verification of successful restart of all services
-- Generating cluster state report`,
+- Generating cluster state report
+
+This utility requires a Kubernetes context to be specified using the --context flag.`,
 	RunE: runRoot,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() error {
-	return rootCmd.Execute()
+	// Отключаем автоматический вывод help от Cobra
+	rootCmd.SilenceUsage = true
+	rootCmd.SilenceErrors = true
+
+	err := rootCmd.Execute()
+	if err != nil {
+		// Проверяем, является ли ошибка связанной с флагами
+		if strings.Contains(err.Error(), "flag") || strings.Contains(err.Error(), "Usage:") {
+			// Для ошибок, связанных с флагами, выводим help
+			fmt.Fprintf(os.Stderr, "\n")
+			rootCmd.Help()
+		}
+	}
+	return err
 }
 
 func init() {
@@ -64,9 +81,11 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.k8s-rollout-restart.yaml)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Preview operations without execution")
 	rootCmd.Flags().BoolVarP(&execute, "execute", "e", false, "Execute operations")
-	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context")
+	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context (required)")
+	rootCmd.MarkFlagRequired("context")
 	rootCmd.Flags().StringSliceVarP(&namespaces, "namespace", "n", []string{}, "Kubernetes namespace(s). Multiple namespaces can be specified comma-separated.")
 	rootCmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Process resources across all namespaces")
+	rootCmd.Flags().StringSliceVar(&ignoreNS, "ignore-namespaces", []string{"karpenter"}, "Namespaces to ignore. Multiple namespaces can be specified comma-separated.")
 	rootCmd.Flags().IntVarP(&parallel, "parallel", "p", 5, "Parallelism degree")
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 300, "Timeout in seconds")
 	rootCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text|json)")
@@ -77,6 +96,8 @@ func init() {
 	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
 	rootCmd.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 50, "The maximum queries-per-second of requests sent to the Kubernetes API")
 	rootCmd.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 300, "The maximum burst queries-per-second of requests sent to the Kubernetes API")
+	rootCmd.Flags().StringSliceVar(&nodeLabels, "node-labels", []string{}, "Only cordon nodes with these labels (format: key=value). Multiple labels can be specified comma-separated.")
+	rootCmd.Flags().StringSliceVar(&excludeLabels, "exclude-node-labels", []string{"eks.amazonaws.com/compute-type=fargate"}, "Exclude nodes with these labels from cordon (format: key=value). Multiple labels can be specified comma-separated.")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
@@ -109,12 +130,17 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		log.SetFormat(logger.JSONFormat)
 	}
 
+	// Verify context is specified
+	if ctxName == "" {
+		return fmt.Errorf("Kubernetes context must be specified using --context flag")
+	}
+
 	// Immediately log the start of execution
 	mode := "DRY-RUN"
 	if execute {
 		mode = "EXECUTE"
 	}
-	log.Info("Starting k8s-rollout-restart in %s mode", mode)
+	log.Info("Starting k8s-rollout-restart in %s mode with context: %s", mode, ctxName)
 
 	// Verify flags
 	if !dryRun && !execute {
@@ -144,9 +170,6 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Initialize rollback manager
-	rollbackMgr := operations.NewRollbackManager(log)
-
 	// Initialize Kubernetes client
 	log.Info("Initializing Kubernetes client")
 	client, err := k8s.NewClient(ctxName, kubeAPIQPS, kubeAPIBurst)
@@ -166,9 +189,36 @@ func runRoot(cmd *cobra.Command, args []string) error {
 
 		namespaces = []string{}
 		for _, ns := range nsList.Items {
-			namespaces = append(namespaces, ns.Name)
+			// Skip ignored namespaces
+			shouldSkip := false
+			for _, ignore := range ignoreNS {
+				if ns.Name == ignore {
+					shouldSkip = true
+					break
+				}
+			}
+			if !shouldSkip {
+				namespaces = append(namespaces, ns.Name)
+			}
 		}
-		log.Info("Found %d namespaces", len(namespaces))
+		log.Info("Found %d namespaces (excluding %v)", len(namespaces), ignoreNS)
+	} else if len(namespaces) > 0 {
+		// Filter out ignored namespaces from explicitly specified ones
+		filteredNS := []string{}
+		for _, ns := range namespaces {
+			shouldSkip := false
+			for _, ignore := range ignoreNS {
+				if ns == ignore {
+					shouldSkip = true
+					break
+				}
+			}
+			if !shouldSkip {
+				filteredNS = append(filteredNS, ns)
+			}
+		}
+		namespaces = filteredNS
+		log.Info("Filtered namespaces (excluding %v): %v", ignoreNS, namespaces)
 	}
 
 	// Parse olderThan parameter
@@ -189,7 +239,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge)
 	rep := reporter.NewReporter(client.Clientset())
 
-	// Setup signal handling with rollback
+	// Setup signal handling
 	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
 	defer cancel()
 
@@ -197,18 +247,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Warning("Received interrupt signal, initiating graceful shutdown and rollback")
-
-		// Rollback on interrupt if not in dry-run mode
-		if !dryRun {
-			shutdownCtx, shutdownCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
-			defer shutdownCancel()
-
-			if err := rollbackMgr.Rollback(shutdownCtx); err != nil {
-				log.Error("Rollback failed: %v", err)
-			}
-		}
-
+		log.Warning("Received interrupt signal, initiating graceful shutdown")
 		cancel()
 	}()
 
@@ -273,141 +312,14 @@ func runRoot(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		log.Info("\nOperations that would be performed:")
-		if len(namespaces) > 0 {
-			if doCordon {
-				log.Info("1. Cordon nodes with pods from namespace: %s", namespaces[0])
-				operationNumber := 2
-				if restartDeployments {
-					log.Info("%d. Restart all deployments in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				if restartStatefulSets {
-					log.Info("%d. Restart all statefulsets in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				if restartKafka {
-					log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				if restartPostgresql {
-					log.Info("%d. Restart PostgreSQL clusters in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				log.Info("%d. Wait for all components to be ready", operationNumber)
-				operationNumber++
-				log.Info("%d. Uncordon nodes with pods from namespace: %s", operationNumber, namespaces[0])
-			} else {
-				operationNumber := 1
-				if restartDeployments {
-					log.Info("%d. Restart all deployments in namespace: %s (without cordoning nodes)", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				if restartStatefulSets {
-					log.Info("%d. Restart all statefulsets in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				if restartKafka {
-					log.Info("%d. Restart Kafka clusters in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				if restartPostgresql {
-					log.Info("%d. Restart PostgreSQL clusters in namespace: %s", operationNumber, namespaces[0])
-					operationNumber++
-				}
-				log.Info("%d. Wait for all components to be ready", operationNumber)
-			}
-		} else {
-			if doCordon {
-				log.Info("1. Cordon all nodes")
-				operationNumber := 2
-				if restartDeployments {
-					log.Info("%d. Restart all deployments in all namespaces", operationNumber)
-					operationNumber++
-				}
-				if restartStatefulSets {
-					log.Info("%d. Restart all statefulsets in all namespaces", operationNumber)
-					operationNumber++
-				}
-				if restartKafka {
-					log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
-					operationNumber++
-				}
-				if restartPostgresql {
-					log.Info("%d. Restart PostgreSQL clusters in all namespaces", operationNumber)
-					operationNumber++
-				}
-				log.Info("%d. Wait for all components to be ready", operationNumber)
-				operationNumber++
-				log.Info("%d. Uncordon all nodes", operationNumber)
-			} else {
-				operationNumber := 1
-				if restartDeployments {
-					log.Info("%d. Restart all deployments in all namespaces (without cordoning nodes)", operationNumber)
-					operationNumber++
-				}
-				if restartStatefulSets {
-					log.Info("%d. Restart all statefulsets in all namespaces", operationNumber)
-					operationNumber++
-				}
-				if restartKafka {
-					log.Info("%d. Restart Kafka clusters in all namespaces", operationNumber)
-					operationNumber++
-				}
-				if restartPostgresql {
-					log.Info("%d. Restart PostgreSQL clusters in all namespaces", operationNumber)
-					operationNumber++
-				}
-				log.Info("%d. Wait for all components to be ready", operationNumber)
-			}
-		}
-
-		if !noFlagger {
-			log.Info("\nNote: For Flagger-managed deployments, only primary deployments will be restarted. Deployments without a primary counterpart will also be restarted.")
-		}
-
-		log.Info("\nParallel operations: %d", parallel)
-		log.Info("Operation timeout: %d seconds", timeout)
-
-		if doCordon {
-			clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes)
-		}
-		if restartDeployments {
-			deployOps.RestartDeployments(ctx, namespaces)
-		}
-		if restartStatefulSets {
-			statefulSetOps.RestartStatefulSets(ctx, namespaces)
-		}
-		if restartKafka {
-			kafkaOps.RestartKafkaClusters(ctx, namespaces)
-		}
-		if restartPostgresql {
-			postgresqlOps.RestartPostgresqlClusters(ctx, namespaces)
-		}
-
 		return nil
-	}
-
-	if output == "json" {
-		jsonData, err := initialState.ToJSON()
-		if err != nil {
-			return fmt.Errorf("failed to marshal initial state: %w", err)
-		}
-		fmt.Printf("Initial state:\n%s\n", string(jsonData))
 	}
 
 	// Cordon nodes - only if doCordon flag is set
 	if doCordon {
 		log.Info("Cordoning nodes")
-		if err := clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes); err != nil {
+		if err := clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes, nodeLabels, excludeLabels); err != nil {
 			return fmt.Errorf("failed to cordon nodes: %w", err)
-		}
-
-		// Register rollback for cordon operation
-		if !dryRun {
-			rollbackMgr.RegisterRollback("Uncordon nodes", func(rollbackCtx context.Context) error {
-				return clusterOps.UncordonNodes(rollbackCtx, namespaces)
-			})
 		}
 	}
 
@@ -415,15 +327,6 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	if restartDeployments {
 		log.Info("Restarting deployments")
 		if err := deployOps.RestartDeployments(ctx, namespaces); err != nil {
-			if doCordon && !dryRun {
-				// Rollback nodes that were cordoned if deployment restart fails
-				rollbackCtx, rollbackCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
-				defer rollbackCancel()
-
-				if rollbackErr := rollbackMgr.Rollback(rollbackCtx); rollbackErr != nil {
-					log.Error("Rollback failed: %v", rollbackErr)
-				}
-			}
 			return fmt.Errorf("failed to restart deployments: %w", err)
 		}
 	}
@@ -432,15 +335,6 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	if restartStatefulSets {
 		log.Info("Restarting statefulsets")
 		if err := statefulSetOps.RestartStatefulSets(ctx, namespaces); err != nil {
-			if doCordon && !dryRun {
-				// Rollback nodes that were cordoned if statefulset restart fails
-				rollbackCtx, rollbackCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
-				defer rollbackCancel()
-
-				if rollbackErr := rollbackMgr.Rollback(rollbackCtx); rollbackErr != nil {
-					log.Error("Rollback failed: %v", rollbackErr)
-				}
-			}
 			return fmt.Errorf("failed to restart statefulsets: %w", err)
 		}
 	}
@@ -482,8 +376,6 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		if err := clusterOps.UncordonNodes(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to uncordon nodes: %w", err)
 		}
-		// Clear rollback operations since we manually performed the uncordon
-		rollbackMgr.Clear()
 	}
 
 	log.Success("Cluster maintenance completed successfully")

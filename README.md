@@ -19,7 +19,6 @@ A Go console utility for automating Kubernetes cluster maintenance process, incl
 - **Optional Node Cordoning**: Enable/disable node cordoning with the `--cordon` flag
 - **Resource Type Selection**: Specify which resource types to restart (deployments, statefulsets, or all)
 - **Structured Logging**: Output logs in either human-readable format or structured JSON
-- **Rollback Support**: Automatic rollback on errors or interruption
 - **Parallelism Control**: Configure the degree of parallel operations
 
 ## Requirements
@@ -87,49 +86,52 @@ roleRef:
 
 ```bash
 # Preview operations (dry-run mode)
-k8s-rollout-restart --dry-run
+k8s-rollout-restart --context=my-cluster --dry-run
 
 # Execute operations
-k8s-rollout-restart --execute
+k8s-rollout-restart --context=my-cluster --execute
 
 # Use specific Kubernetes context
-k8s-rollout-restart --execute --context=production-cluster
+k8s-rollout-restart --context=production-cluster --execute
 
 # Limit to namespace
-k8s-rollout-restart --execute --namespace=app-namespace
+k8s-rollout-restart --context=my-cluster --execute --namespace=app-namespace
 
 # Process resources across all namespaces
-k8s-rollout-restart --execute --all-namespaces
+k8s-rollout-restart --context=my-cluster --execute --all-namespaces
+
+# Ignore specific namespaces
+k8s-rollout-restart --context=my-cluster --execute --ignore-namespaces=karpenter,kube-system
 
 # Configure parallel processing
-k8s-rollout-restart --execute --parallel=10 --timeout=600
+k8s-rollout-restart --context=my-cluster --execute --parallel=10 --timeout=600
 
 # Enable node cordoning (only nodes with pods in target namespaces)
-k8s-rollout-restart --execute --cordon
+k8s-rollout-restart --context=my-cluster --execute --cordon
 
 # Enable cordoning of all nodes in the cluster
-k8s-rollout-restart --execute --cordon --cordon-all-nodes
+k8s-rollout-restart --context=my-cluster --execute --cordon --cordon-all-nodes
 
 # JSON output
-k8s-rollout-restart --dry-run --output=json
+k8s-rollout-restart --context=my-cluster --dry-run --output=json
 
 # Restart specific resource types
-k8s-rollout-restart --execute --resources=deployments
-k8s-rollout-restart --execute --resources=statefulsets
-k8s-rollout-restart --execute --resources=strimzi-kafka
-k8s-rollout-restart --execute --resources=zalando-postgresql
+k8s-rollout-restart --context=my-cluster --execute --resources=deployments
+k8s-rollout-restart --context=my-cluster --execute --resources=statefulsets
+k8s-rollout-restart --context=my-cluster --execute --resources=strimzi-kafka
+k8s-rollout-restart --context=my-cluster --execute --resources=zalando-postgresql
 
 # Restart multiple resource types
-k8s-rollout-restart --execute --resources=deployments,statefulsets
+k8s-rollout-restart --context=my-cluster --execute --resources=deployments,statefulsets
 
 # or restart all types of resources
-k8s-rollout-restart --execute --resources=all
+k8s-rollout-restart --context=my-cluster --execute --resources=all
 
 # Restart only resources older than 7 days
-k8s-rollout-restart --execute --older-than=7d
+k8s-rollout-restart --context=my-cluster --execute --older-than=7d
 
 # Restart only StatefulSets older than 24 hours
-k8s-rollout-restart --execute --resources=statefulsets --older-than=24h
+k8s-rollout-restart --context=my-cluster --execute --resources=statefulsets --older-than=24h
 ```
 
 ## Kafka Clusters Restart
@@ -173,13 +175,6 @@ The utility has special handling for deployments managed by [Flagger](https://fl
 - Use the `--no-flagger-filter` flag to restart all deployments regardless of this logic
 - Note: StatefulSets are always restarted regardless of any Flagger-related owner references
 
-## Automatic Rollback
-
-The utility includes an automatic rollback mechanism that will:
-- Revert changes on error (e.g., uncordon nodes if an operation fails)
-- Handle SIGINT/SIGTERM signals gracefully with proper cleanup
-- Provide detailed logs of rollback operations
-
 ## Development
 
 ### Running Tests
@@ -194,23 +189,48 @@ go test -tags=integration ./...
 
 ## Options
 
-```
-  -d, --dry-run               Preview operations only
-  -e, --execute               Execute operations
-  -c, --context string        Kubernetes context
-  -n, --namespace strings     Namespaces to target (comma-separated, empty for all namespaces)
-  -A, --all-namespaces        Process resources across all namespaces
-  -p, --parallel int          Parallelism degree (default: 5)
-  -t, --timeout int           Timeout in seconds (default: 300)
-  -o, --output string         Output format (text|json) (default: text)
-  --resources strings         Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all) (default: deployments)
-  --no-flagger-filter         Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)
-  --cordon                    Enable node cordoning
-  --cordon-all-nodes          Cordon all nodes in the cluster, not just those with pods from specified namespaces
-  --older-than string         Restart only resources older than specified duration (e.g. 24h, 30m, 7d)
-  --kube-api-qps float32      The maximum queries-per-second of requests sent to the Kubernetes API (default: 50)
-  --kube-api-burst int        The maximum burst queries-per-second of requests sent to the Kubernetes API (default: 300)
-  -h, --help                  Help
+| Flag | Description |
+|------|-------------|
+| `--config` | Config file (default is $HOME/.k8s-rollout-restart.yaml) |
+| `--context`, `-c` | Kubernetes context (required) |
+| `--dry-run`, `-d` | Preview operations without execution |
+| `--execute`, `-e` | Execute operations |
+| `--namespace`, `-n` | Kubernetes namespace(s). Multiple namespaces can be specified comma-separated |
+| `--all-namespaces`, `-A` | Process resources across all namespaces |
+| `--ignore-namespaces` | Namespaces to ignore. Multiple namespaces can be specified comma-separated (default [karpenter]) |
+| `--parallel`, `-p` | Parallelism degree (default 5) |
+| `--timeout`, `-t` | Timeout in seconds (default 300) |
+| `--output`, `-o` | Output format (text\|json) (default "text") |
+| `--no-flagger-filter` | Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones) |
+| `--cordon` | Whether to cordon nodes before restart (if not set, nodes will not be cordoned) |
+| `--cordon-all-nodes` | Cordon all nodes in the cluster, not just those with pods from specified namespaces |
+| `--node-labels` | Only cordon nodes with these labels (format: key=value). Multiple labels can be specified comma-separated |
+| `--exclude-node-labels` | Exclude nodes with these labels from cordon (format: key=value). Multiple labels can be specified comma-separated (default [eks.amazonaws.com/compute-type=fargate]) |
+| `--resources` | Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all) (default [deployments]) |
+| `--older-than` | Restart only resources older than specified duration (e.g. 24h, 30m, 7d) |
+| `--kube-api-qps` | The maximum queries-per-second of requests sent to the Kubernetes API (default 50) |
+| `--kube-api-burst` | The maximum burst queries-per-second of requests sent to the Kubernetes API (default 300) |
+
+### Examples
+
+```bash
+# Preview operations for a specific namespace
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --dry-run
+
+# Execute operations for a specific namespace
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --execute
+
+# Execute operations for all namespaces
+./k8s-rollout-restart --context=my-cluster --all-namespaces --execute
+
+# Execute operations with node cordoning
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --cordon --execute
+
+# Execute operations with node cordoning and label filtering
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --cordon --node-labels=node-role.kubernetes.io/worker=true --execute
+
+# Execute operations with node cordoning and excluding specific labels
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --cordon --exclude-node-labels=eks.amazonaws.com/compute-type=fargate,node-role.kubernetes.io/master=true --execute
 ```
 
 ## Older Than Filter
