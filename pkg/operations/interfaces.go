@@ -39,84 +39,74 @@ type ClusterOperator interface {
 
 // K8sClient defines the interface for Kubernetes client operations
 type K8sClient interface {
-	// CoreV1 returns the client for core resources
+	// CoreV1 returns interface for working with CoreV1 API
 	CoreV1() CoreV1Interface
-
-	// AppsV1 returns the client for apps resources
+	// AppsV1 returns interface for working with AppsV1 API
 	AppsV1() AppsV1Interface
-
-	// RESTClient returns the REST client
+	// RESTClient returns REST client
 	RESTClient() rest.Interface
+	// ClearCache clears the client cache
+	ClearCache()
 }
 
-// CoreV1Interface defines the interface for core resources
+// CoreV1Interface is an interface for CoreV1 API operations
 type CoreV1Interface interface {
-	// Pods returns the pod client for the given namespace
+	// Pods returns interface for working with pods
 	Pods(namespace string) PodInterface
-
-	// Nodes returns the node client
+	// Nodes returns interface for working with nodes
 	Nodes() NodeInterface
-
-	// Namespaces returns the namespace client
+	// Namespaces returns interface for working with namespaces
 	Namespaces() NamespaceInterface
 }
 
-// AppsV1Interface defines the interface for apps resources
-type AppsV1Interface interface {
-	// Deployments returns the deployment client for the given namespace
-	Deployments(namespace string) DeploymentInterface
-
-	// StatefulSets returns the statefulset client for the given namespace
-	StatefulSets(namespace string) StatefulSetInterface
-}
-
-// PodInterface defines operations on pods
+// PodInterface is an interface for pod operations
 type PodInterface interface {
-	// List lists all pods in the given namespace
+	// List returns a list of pods
 	List(ctx context.Context, opts metav1.ListOptions) (*corev1.PodList, error)
 }
 
-// NodeInterface defines operations on nodes
+// NodeInterface is an interface for node operations
 type NodeInterface interface {
-	// List lists all nodes
+	// List returns a list of nodes
 	List(ctx context.Context, opts metav1.ListOptions) (*corev1.NodeList, error)
-
-	// Update updates the given node
+	// Update updates a node
 	Update(ctx context.Context, node *corev1.Node, opts metav1.UpdateOptions) (*corev1.Node, error)
 }
 
-// DeploymentInterface defines operations on deployments
+// NamespaceInterface is an interface for namespace operations
+type NamespaceInterface interface {
+	// List returns a list of namespaces
+	List(ctx context.Context, opts metav1.ListOptions) (*corev1.NamespaceList, error)
+}
+
+// AppsV1Interface is an interface for AppsV1 API operations
+type AppsV1Interface interface {
+	// Deployments returns interface for working with deployments
+	Deployments(namespace string) DeploymentInterface
+	// StatefulSets returns interface for working with statefulsets
+	StatefulSets(namespace string) StatefulSetInterface
+}
+
+// DeploymentInterface is an interface for deployment operations
 type DeploymentInterface interface {
-	// List lists all deployments in the given namespace
+	// List returns a list of deployments
 	List(ctx context.Context, opts metav1.ListOptions) (*appsv1.DeploymentList, error)
-
-	// Get gets the deployment with the specified name
+	// Get returns a deployment
 	Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.Deployment, error)
-
-	// Update updates the given deployment
+	// Update updates a deployment
 	Update(ctx context.Context, deployment *appsv1.Deployment, opts metav1.UpdateOptions) (*appsv1.Deployment, error)
-
-	// Patch applies the patch to the deployment with the given name
+	// Patch patches a deployment
 	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*appsv1.Deployment, error)
 }
 
-// StatefulSetInterface defines operations on statefulsets
+// StatefulSetInterface is an interface for statefulset operations
 type StatefulSetInterface interface {
-	// List lists all statefulsets in the given namespace
+	// List returns a list of statefulsets
 	List(ctx context.Context, opts metav1.ListOptions) (*appsv1.StatefulSetList, error)
-
-	// Get gets the statefulset with the specified name
+	// Get returns a statefulset
 	Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error)
-
-	// Update updates the given statefulset
+	// Update updates a statefulset
 	Update(ctx context.Context, statefulset *appsv1.StatefulSet, opts metav1.UpdateOptions) (*appsv1.StatefulSet, error)
-
-	// Patch applies the patch to the statefulset with the given name
+	// Patch patches a statefulset
 	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*appsv1.StatefulSet, error)
-}
-
-// NamespaceInterface defines operations on namespaces
-type NamespaceInterface interface {
-	// List lists all namespaces
-	List(ctx context.Context, opts metav1.ListOptions) (*corev1.NamespaceList, error)
 }

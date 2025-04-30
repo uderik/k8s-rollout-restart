@@ -2,12 +2,11 @@ package cmd
 
 import (
 	stdcontext "context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -39,6 +38,7 @@ var (
 	kubeAPIBurst   int
 	nodeLabels     []string
 	excludeLabels  []string
+	clearCache     bool
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -94,10 +94,11 @@ func init() {
 	rootCmd.Flags().BoolVar(&cordonAllNodes, "cordon-all-nodes", false, "Cordon all nodes in the cluster, not just those with pods from specified namespaces")
 	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all)")
 	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
-	rootCmd.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 50, "The maximum queries-per-second of requests sent to the Kubernetes API")
-	rootCmd.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 300, "The maximum burst queries-per-second of requests sent to the Kubernetes API")
+	rootCmd.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 20, "QPS for Kubernetes API client")
+	rootCmd.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Burst for Kubernetes API client")
 	rootCmd.Flags().StringSliceVar(&nodeLabels, "node-labels", []string{}, "Only cordon nodes with these labels (format: key=value). Multiple labels can be specified comma-separated.")
 	rootCmd.Flags().StringSliceVar(&excludeLabels, "exclude-node-labels", []string{"eks.amazonaws.com/compute-type=fargate"}, "Exclude nodes with these labels from cordon (format: key=value). Multiple labels can be specified comma-separated.")
+	rootCmd.Flags().BoolVar(&clearCache, "clear-cache", false, "Clear Kubernetes client cache before execution")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
@@ -177,54 +178,34 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
+	// Clear cache if requested
+	if clearCache {
+		log.Info("Clearing Kubernetes client cache")
+		client.ClearCache()
+	}
+
 	k8sClient := client.AsK8sClient()
 
 	// If all-namespaces flag is set, get all namespaces
 	if allNamespaces {
 		log.Info("Getting all namespaces")
-		nsList, err := k8sClient.CoreV1().Namespaces().List(stdcontext.Background(), metav1.ListOptions{})
+		namespacesList, err := k8sClient.CoreV1().Namespaces().List(stdcontext.Background(), metav1.ListOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to list namespaces: %w", err)
 		}
 
-		namespaces = []string{}
-		for _, ns := range nsList.Items {
-			// Skip ignored namespaces
-			shouldSkip := false
-			for _, ignore := range ignoreNS {
-				if ns.Name == ignore {
-					shouldSkip = true
-					break
-				}
+		for _, ns := range namespacesList.Items {
+			// Skip kube-system and kube-public namespaces
+			if ns.Name == "kube-system" || ns.Name == "kube-public" {
+				continue
 			}
-			if !shouldSkip {
-				namespaces = append(namespaces, ns.Name)
-			}
+			namespaces = append(namespaces, ns.Name)
 		}
-		log.Info("Found %d namespaces (excluding %v)", len(namespaces), ignoreNS)
-	} else if len(namespaces) > 0 {
-		// Filter out ignored namespaces from explicitly specified ones
-		filteredNS := []string{}
-		for _, ns := range namespaces {
-			shouldSkip := false
-			for _, ignore := range ignoreNS {
-				if ns == ignore {
-					shouldSkip = true
-					log.Warning("Namespace %s is in ignore list, skipping", ns)
-					break
-				}
-			}
-			if !shouldSkip {
-				filteredNS = append(filteredNS, ns)
-			}
-		}
-		namespaces = filteredNS
+	}
 
-		if len(namespaces) == 0 {
-			return fmt.Errorf("all specified namespaces are in ignore list. If you want to use these namespaces, please specify --ignore-namespaces=\"\"")
-		}
-
-		log.Info("Filtered namespaces (excluding %v): %v", ignoreNS, namespaces)
+	// Validate namespaces
+	if len(namespaces) == 0 {
+		return fmt.Errorf("no namespaces specified")
 	}
 
 	// Parse olderThan parameter
@@ -237,149 +218,148 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		minAge = &duration
 	}
 
-	// Create operation handlers
+	// Create operations
 	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, noFlagger, dryRun)
-	deployOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
+	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
 	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
 	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge)
 	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge)
-	rep := reporter.NewReporter(client.Clientset())
 
-	// Setup signal handling
-	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Warning("Received interrupt signal, initiating graceful shutdown")
-		cancel()
-	}()
+	// Initialize reporter
+	log.Info("Initializing reporter")
+	reporter := reporter.NewReporter(k8sClient)
 
 	// Generate initial report
-	log.Info("Generating initial cluster state report")
-	initialState, err := rep.GenerateReport(ctx, namespaces)
+	log.Info("Generating initial report")
+	initialReport, err := reporter.GenerateReport(stdcontext.Background(), namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate initial report: %w", err)
 	}
 
+	// If dry-run, just print the report and exit
 	if dryRun {
-		log.Info("=== DRY RUN MODE - No changes will be made ===")
-		log.Info("\nInitial cluster state:")
-		log.Info("Nodes: %d (%d unschedulable)", len(initialState.Nodes), countUnschedulableNodes(initialState))
-
-		totalPods := 0
-		if len(namespaces) > 0 {
-			for _, ns := range namespaces {
-				if pods, exists := initialState.Pods[ns]; exists {
-					totalPods += len(pods)
-					log.Info("Namespace %s: %d pods", ns, len(pods))
-				} else {
-					log.Info("Namespace %s: not found or contains no pods", ns)
-				}
-			}
-		} else {
-			for ns, pods := range initialState.Pods {
-				totalPods += len(pods)
-				log.Info("Namespace %s: %d pods", ns, len(pods))
-			}
+		log.Info("Dry-run mode: would perform the following operations:")
+		if restartDeployments {
+			log.Info("  - Restart deployments in namespaces: %v", namespaces)
 		}
-		log.Info("Total pods: %d", totalPods)
+		if restartStatefulSets {
+			log.Info("  - Restart statefulsets in namespaces: %v", namespaces)
+		}
+		if restartKafka {
+			log.Info("  - Restart Kafka clusters in namespaces: %v", namespaces)
+		}
+		if restartPostgresql {
+			log.Info("  - Restart PostgreSQL clusters in namespaces: %v", namespaces)
+		}
+		if doCordon {
+			log.Info("  - Cordon nodes with pods from namespaces: %v", namespaces)
+		}
 
-		log.Info("\nComponents to be restarted:")
-		if len(namespaces) > 0 {
-			for _, ns := range namespaces {
-				if restartDeployments {
-					log.Info("- Deployments in namespace %s will be restarted", ns)
-				}
-				if restartStatefulSets {
-					log.Info("- StatefulSets in namespace %s will be restarted", ns)
-				}
-				if restartKafka {
-					log.Info("- Kafka clusters in namespace %s will be restarted", ns)
-				}
-				if restartPostgresql {
-					log.Info("- PostgreSQL clusters in namespace %s will be restarted", ns)
-				}
+		// Print initial report
+		if output == "json" {
+			jsonData, err := json.Marshal(initialReport)
+			if err != nil {
+				return fmt.Errorf("failed to marshal report to JSON: %w", err)
 			}
+			fmt.Println(string(jsonData))
 		} else {
+			log.Info("Initial cluster state:")
+			components := make([]string, 0)
 			if restartDeployments {
-				log.Info("- Deployments: %d", initialState.Components.Deployments)
+				components = append(components, fmt.Sprintf("Deployments: %d", initialReport.Components.Deployments))
 			}
 			if restartStatefulSets {
-				log.Info("- StatefulSets: %d", initialState.Components.StatefulSets)
+				components = append(components, fmt.Sprintf("StatefulSets: %d", initialReport.Components.StatefulSets))
 			}
 			if restartKafka {
-				log.Info("- Kafka clusters: %d", initialState.Components.Kafka)
+				components = append(components, fmt.Sprintf("Kafka: %d", initialReport.Components.Kafka))
 			}
 			if restartPostgresql {
-				log.Info("- PostgreSQL clusters: %d", initialState.Components.Postgresql)
+				components = append(components, fmt.Sprintf("PostgreSQL: %d", initialReport.Components.Postgresql))
 			}
+			log.Info("Nodes: %d, %s, Unschedulable: %d",
+				len(initialReport.Nodes),
+				strings.Join(components, ", "),
+				countUnschedulableNodes(initialReport))
 		}
-
 		return nil
 	}
 
-	// Cordon nodes - only if doCordon flag is set
+	// Execute operations
 	if doCordon {
 		log.Info("Cordoning nodes")
-		if err := clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes, nodeLabels, excludeLabels); err != nil {
+		if err := clusterOps.CordonNodes(stdcontext.Background(), namespaces, cordonAllNodes, nodeLabels, excludeLabels); err != nil {
 			return fmt.Errorf("failed to cordon nodes: %w", err)
 		}
 	}
 
-	// Restart deployments if selected
 	if restartDeployments {
 		log.Info("Restarting deployments")
-		if err := deployOps.RestartDeployments(ctx, namespaces); err != nil {
+		if err := deploymentOps.RestartDeployments(stdcontext.Background(), namespaces); err != nil {
 			return fmt.Errorf("failed to restart deployments: %w", err)
 		}
 	}
 
-	// Restart statefulsets if selected
 	if restartStatefulSets {
 		log.Info("Restarting statefulsets")
-		if err := statefulSetOps.RestartStatefulSets(ctx, namespaces); err != nil {
+		if err := statefulSetOps.RestartStatefulSets(stdcontext.Background(), namespaces); err != nil {
 			return fmt.Errorf("failed to restart statefulsets: %w", err)
 		}
 	}
 
-	// Restart Kafka clusters
 	if restartKafka {
 		log.Info("Restarting Kafka clusters")
-		if err := kafkaOps.RestartKafkaClusters(ctx, namespaces); err != nil {
-			log.Warning("Failed to restart Kafka clusters: %v", err)
+		if err := kafkaOps.RestartKafkaClusters(stdcontext.Background(), namespaces); err != nil {
+			return fmt.Errorf("failed to restart Kafka clusters: %w", err)
 		}
 	}
 
-	// Restart PostgreSQL clusters
 	if restartPostgresql {
 		log.Info("Restarting PostgreSQL clusters")
-		if err := postgresqlOps.RestartPostgresqlClusters(ctx, namespaces); err != nil {
+		if err := postgresqlOps.RestartPostgresqlClusters(stdcontext.Background(), namespaces); err != nil {
 			return fmt.Errorf("failed to restart PostgreSQL clusters: %w", err)
 		}
 	}
 
 	// Generate final report
-	log.Info("Generating final cluster state report")
-	finalState, err := rep.GenerateReport(ctx, namespaces)
+	log.Info("Generating final report")
+	finalReport, err := reporter.GenerateReport(stdcontext.Background(), namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate final report: %w", err)
 	}
 
+	// Print final report
 	if output == "json" {
-		jsonData, err := finalState.ToJSON()
+		jsonData, err := json.Marshal(finalReport)
 		if err != nil {
-			return fmt.Errorf("failed to marshal final state: %w", err)
+			return fmt.Errorf("failed to marshal report to JSON: %w", err)
 		}
-		fmt.Printf("Final state:\n%s\n", string(jsonData))
+		fmt.Println(string(jsonData))
+	} else {
+		log.Info("Final cluster state:")
+		components := make([]string, 0)
+		if restartDeployments {
+			components = append(components, fmt.Sprintf("Deployments: %d", finalReport.Components.Deployments))
+		}
+		if restartStatefulSets {
+			components = append(components, fmt.Sprintf("StatefulSets: %d", finalReport.Components.StatefulSets))
+		}
+		if restartKafka {
+			components = append(components, fmt.Sprintf("Kafka: %d", finalReport.Components.Kafka))
+		}
+		if restartPostgresql {
+			components = append(components, fmt.Sprintf("PostgreSQL: %d", finalReport.Components.Postgresql))
+		}
+		log.Info("Nodes: %d, %s, Unschedulable: %d",
+			len(finalReport.Nodes),
+			strings.Join(components, ", "),
+			countUnschedulableNodes(finalReport))
 	}
 
-	// Execute rollback to uncordon nodes if needed
-	if doCordon && !dryRun {
+	// Uncordon nodes if they were cordoned
+	if doCordon {
 		log.Info("Uncordoning nodes")
-		if err := clusterOps.UncordonNodes(ctx, namespaces); err != nil {
+		if err := clusterOps.UncordonNodes(stdcontext.Background(), namespaces); err != nil {
 			return fmt.Errorf("failed to uncordon nodes: %w", err)
 		}
 	}

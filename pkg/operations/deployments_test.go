@@ -134,7 +134,7 @@ func TestDeploymentOperations_ListError(t *testing.T) {
 	mockDeployInterface.On("List", mock.Anything, mock.Anything).Return(nil, expectedError)
 
 	// Create DeploymentOperations
-	// Аргументы: clientset, parallel, timeout, noFlagger, dryRun, minAge
+	// Arguments: clientset, parallel, timeout, noFlagger, dryRun, minAge
 	deployOps := NewDeploymentOperations(mockClient, 1, 60, false, true, nil)
 
 	// Call RestartDeployments
@@ -172,7 +172,7 @@ func TestDeploymentOperations_NoDeployments(t *testing.T) {
 	mockDeployInterface.On("List", mock.Anything, mock.Anything).Return(emptyDeployList, nil)
 
 	// Create DeploymentOperations
-	// Аргументы: clientset, parallel, timeout, noFlagger, dryRun, minAge
+	// Arguments: clientset, parallel, timeout, noFlagger, dryRun, minAge
 	deployOps := NewDeploymentOperations(mockClient, 1, 60, false, true, nil)
 
 	// Call RestartDeployments

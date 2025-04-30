@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/uderik/k8s-rollout-restart/pkg/operations"
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,10 +17,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// Client represents a Kubernetes API client
+// Client wraps Kubernetes client with additional functionality
 type Client struct {
-	clientset *kubernetes.Clientset
-	config    *rest.Config
+	clientset    kubernetes.Interface
+	cacheManager *CacheManager
 }
 
 // NewClient creates a new Kubernetes client
@@ -41,54 +42,96 @@ func NewClient(context string, qps float32, burst int) (*Client, error) {
 	config.QPS = qps
 	config.Burst = burst
 
-	clientset, err := kubernetes.NewForConfig(config)
+	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Kubernetes clientset: %w", err)
 	}
 
+	// Create CacheManager with default settings
+	cacheConfig := CacheConfig{
+		RateLimit: float64(qps),     // Use the same QPS
+		Burst:     burst,            // Use the same Burst
+		CacheTTL:  30 * time.Second, // Reduce cache TTL to 30 seconds
+	}
+
+	cacheManager := NewCacheManager(client, cacheConfig)
+
 	return &Client{
-		clientset: clientset,
-		config:    config,
+		clientset:    client,
+		cacheManager: cacheManager,
 	}, nil
 }
 
-// Clientset returns the underlying Kubernetes clientset
-func (c *Client) Clientset() *kubernetes.Clientset {
-	return c.clientset
+// GetDeployment retrieves Deployment through CacheManager
+func (c *Client) GetDeployment(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
+	return c.cacheManager.GetDeployment(ctx, namespace, name)
 }
 
-// RESTConfig returns the REST config
-func (c *Client) RESTConfig() *rest.Config {
-	return c.config
+// GetStatefulSet retrieves StatefulSet through CacheManager
+func (c *Client) GetStatefulSet(ctx context.Context, namespace, name string) (*appsv1.StatefulSet, error) {
+	return c.cacheManager.GetStatefulSet(ctx, namespace, name)
 }
 
-// AsK8sClient returns the Client as an operations.K8sClient interface
-func (c *Client) AsK8sClient() operations.K8sClient {
-	return &k8sClientAdapter{
-		clientset: c.clientset,
+// GetNode retrieves Node through CacheManager
+func (c *Client) GetNode(ctx context.Context, name string) (*corev1.Node, error) {
+	return c.cacheManager.GetNode(ctx, name)
+}
+
+// GetNamespace retrieves Namespace through CacheManager
+func (c *Client) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
+	return c.cacheManager.GetNamespace(ctx, name)
+}
+
+// InvalidateCache clears the cache
+func (c *Client) InvalidateCache() {
+	c.cacheManager.InvalidateCache()
+}
+
+// ClearCache clears the client cache
+func (c *Client) ClearCache() {
+	if c.cacheManager != nil {
+		c.cacheManager.InvalidateCache()
 	}
 }
 
-// k8sClientAdapter adapts a kubernetes.Clientset to the operations.K8sClient interface
+// AsK8sClient returns a K8sClient interface implementation
+func (c *Client) AsK8sClient() operations.K8sClient {
+	return &k8sClientAdapter{
+		client: c,
+	}
+}
+
+// k8sClientAdapter adapts our Client to the operations.K8sClient interface
 type k8sClientAdapter struct {
-	clientset *kubernetes.Clientset
+	client *Client
 }
 
 func (a *k8sClientAdapter) CoreV1() operations.CoreV1Interface {
-	return &coreV1Adapter{coreV1: a.clientset.CoreV1()}
+	return &coreV1Adapter{
+		coreV1:       a.client.clientset.CoreV1(),
+		cacheManager: a.client.cacheManager,
+	}
 }
 
 func (a *k8sClientAdapter) AppsV1() operations.AppsV1Interface {
-	return &appsV1Adapter{appsV1: a.clientset.AppsV1()}
+	return &appsV1Adapter{
+		appsV1:       a.client.clientset.AppsV1(),
+		cacheManager: a.client.cacheManager,
+	}
 }
 
 func (a *k8sClientAdapter) RESTClient() rest.Interface {
-	return a.clientset.RESTClient()
+	return a.client.clientset.Discovery().RESTClient()
 }
 
-// coreV1Adapter adapts a CoreV1Client to the operations.CoreV1Interface
+func (a *k8sClientAdapter) ClearCache() {
+	a.client.cacheManager.InvalidateCache()
+}
+
+// coreV1Adapter adapts CoreV1Interface
 type coreV1Adapter struct {
-	coreV1 typedcorev1.CoreV1Interface
+	coreV1       typedcorev1.CoreV1Interface
+	cacheManager *CacheManager
 }
 
 func (a *coreV1Adapter) Pods(namespace string) operations.PodInterface {
@@ -103,7 +146,7 @@ func (a *coreV1Adapter) Namespaces() operations.NamespaceInterface {
 	return &namespaceAdapter{namespaces: a.coreV1.Namespaces()}
 }
 
-// podAdapter adapts a pod client to operations.PodInterface
+// podAdapter adapts PodInterface
 type podAdapter struct {
 	pods typedcorev1.PodInterface
 }
@@ -112,7 +155,7 @@ func (a *podAdapter) List(ctx context.Context, opts metav1.ListOptions) (*corev1
 	return a.pods.List(ctx, opts)
 }
 
-// nodeAdapter adapts a node client to operations.NodeInterface
+// nodeAdapter adapts NodeInterface
 type nodeAdapter struct {
 	nodes typedcorev1.NodeInterface
 }
@@ -125,8 +168,7 @@ func (a *nodeAdapter) Update(ctx context.Context, node *corev1.Node, opts metav1
 	return a.nodes.Update(ctx, node, opts)
 }
 
-// Add namespace adapter
-// namespaceAdapter adapts a namespace client to operations.NamespaceInterface
+// namespaceAdapter adapts NamespaceInterface
 type namespaceAdapter struct {
 	namespaces typedcorev1.NamespaceInterface
 }
@@ -135,22 +177,33 @@ func (a *namespaceAdapter) List(ctx context.Context, opts metav1.ListOptions) (*
 	return a.namespaces.List(ctx, opts)
 }
 
-// appsV1Adapter adapts an AppsV1Client to operations.AppsV1Interface
+// appsV1Adapter adapts AppsV1Interface
 type appsV1Adapter struct {
-	appsV1 typedappsv1.AppsV1Interface
+	appsV1       typedappsv1.AppsV1Interface
+	cacheManager *CacheManager
 }
 
 func (a *appsV1Adapter) Deployments(namespace string) operations.DeploymentInterface {
-	return &deploymentAdapter{deployments: a.appsV1.Deployments(namespace)}
+	return &deploymentAdapter{
+		deployments:  a.appsV1.Deployments(namespace),
+		cacheManager: a.cacheManager,
+		namespace:    namespace,
+	}
 }
 
 func (a *appsV1Adapter) StatefulSets(namespace string) operations.StatefulSetInterface {
-	return &statefulSetAdapter{statefulsets: a.appsV1.StatefulSets(namespace)}
+	return &statefulSetAdapter{
+		statefulsets: a.appsV1.StatefulSets(namespace),
+		cacheManager: a.cacheManager,
+		namespace:    namespace,
+	}
 }
 
-// deploymentAdapter adapts a deployment client to operations.DeploymentInterface
+// deploymentAdapter adapts DeploymentInterface
 type deploymentAdapter struct {
-	deployments typedappsv1.DeploymentInterface
+	deployments  typedappsv1.DeploymentInterface
+	cacheManager *CacheManager
+	namespace    string
 }
 
 func (a *deploymentAdapter) List(ctx context.Context, opts metav1.ListOptions) (*appsv1.DeploymentList, error) {
@@ -158,7 +211,7 @@ func (a *deploymentAdapter) List(ctx context.Context, opts metav1.ListOptions) (
 }
 
 func (a *deploymentAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.Deployment, error) {
-	return a.deployments.Get(ctx, name, opts)
+	return a.cacheManager.GetDeployment(ctx, a.namespace, name)
 }
 
 func (a *deploymentAdapter) Update(ctx context.Context, deployment *appsv1.Deployment, opts metav1.UpdateOptions) (*appsv1.Deployment, error) {
@@ -169,9 +222,11 @@ func (a *deploymentAdapter) Patch(ctx context.Context, name string, pt types.Pat
 	return a.deployments.Patch(ctx, name, pt, data, opts)
 }
 
-// statefulSetAdapter adapts a statefulset client to operations.StatefulSetInterface
+// statefulSetAdapter adapts StatefulSetInterface
 type statefulSetAdapter struct {
 	statefulsets typedappsv1.StatefulSetInterface
+	cacheManager *CacheManager
+	namespace    string
 }
 
 func (a *statefulSetAdapter) List(ctx context.Context, opts metav1.ListOptions) (*appsv1.StatefulSetList, error) {
@@ -179,7 +234,7 @@ func (a *statefulSetAdapter) List(ctx context.Context, opts metav1.ListOptions) 
 }
 
 func (a *statefulSetAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error) {
-	return a.statefulsets.Get(ctx, name, opts)
+	return a.cacheManager.GetStatefulSet(ctx, a.namespace, name)
 }
 
 func (a *statefulSetAdapter) Update(ctx context.Context, statefulset *appsv1.StatefulSet, opts metav1.UpdateOptions) (*appsv1.StatefulSet, error) {

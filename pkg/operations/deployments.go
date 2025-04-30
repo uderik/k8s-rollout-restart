@@ -271,6 +271,9 @@ func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, name
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// Track deployments that were ready in previous check
+	previouslyReady := make(map[string]bool)
+
 	for {
 		select {
 		case <-timeoutCtx.Done():
@@ -279,49 +282,85 @@ func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, name
 			// Get current state of deployments
 			deploymentsReady := 0
 			totalDeployments := len(deploymentGenerations)
-			notReadyDeployments := []string{}
+			notReadyDeployments := make(map[string][]string)
 
 			// Check each deployment
-			for deploymentName, _ := range deploymentGenerations {
-				deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			for deploymentName := range deploymentGenerations {
+				// Disable caching to get fresh data
+				deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{
+					ResourceVersion: "0", // Force fresh data
+				})
 				if err != nil {
 					d.log.Warning("Failed to get deployment %s/%s: %v", namespace, deploymentName, err)
-					notReadyDeployments = append(notReadyDeployments, deploymentName)
+					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName], "Failed to get deployment status")
 					continue
 				}
 
-				// Check if deployment generation increased and all conditions are satisfied
-				isReady := true
-
-				// Check if generation was observed
+				// Check if deployment generation increased
 				if deployment.Status.ObservedGeneration < deployment.Generation {
-					isReady = false
+					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
+						fmt.Sprintf("Generation not updated (observed: %d, current: %d)",
+							deployment.Status.ObservedGeneration, deployment.Generation))
+					continue
 				}
 
-				// Check replicas status
-				if deployment.Status.ReadyReplicas != deployment.Status.Replicas ||
-					deployment.Status.UpdatedReplicas != deployment.Status.Replicas ||
-					deployment.Status.AvailableReplicas != deployment.Status.Replicas {
-					isReady = false
-				}
+				// Check deployment conditions
+				progressing := false
+				replicaFailure := false
 
-				// Check all conditions
 				for _, condition := range deployment.Status.Conditions {
-					if condition.Type == appsv1.DeploymentAvailable && condition.Status != "True" {
-						isReady = false
-						break
-					}
-					if condition.Type == appsv1.DeploymentProgressing && condition.Status != "True" {
-						isReady = false
-						break
+					switch condition.Type {
+					case appsv1.DeploymentProgressing:
+						if condition.Status == "True" {
+							progressing = true
+						}
+					case appsv1.DeploymentReplicaFailure:
+						if condition.Status == "True" {
+							replicaFailure = true
+							notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
+								fmt.Sprintf("Replica failure: %s", condition.Message))
+						}
 					}
 				}
 
-				if isReady {
-					deploymentsReady++
-				} else {
-					notReadyDeployments = append(notReadyDeployments, deploymentName)
+				if !progressing {
+					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName], "Not progressing")
+					continue
 				}
+
+				if replicaFailure {
+					continue
+				}
+
+				// Check if all pods are updated to the new generation
+				if deployment.Status.UpdatedReplicas != *deployment.Spec.Replicas {
+					// If deployment was previously ready and has the same number of replicas, consider it ready
+					if previouslyReady[deploymentName] && deployment.Status.Replicas == *deployment.Spec.Replicas {
+						deploymentsReady++
+						continue
+					}
+					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
+						fmt.Sprintf("Pods updating (%d/%d updated)",
+							deployment.Status.UpdatedReplicas, *deployment.Spec.Replicas))
+					continue
+				}
+
+				// Check if all updated pods are ready
+				if deployment.Status.ReadyReplicas != *deployment.Spec.Replicas {
+					// If deployment was previously ready and has the same number of replicas, consider it ready
+					if previouslyReady[deploymentName] && deployment.Status.Replicas == *deployment.Spec.Replicas {
+						deploymentsReady++
+						continue
+					}
+					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
+						fmt.Sprintf("Pods starting (%d/%d ready)",
+							deployment.Status.ReadyReplicas, *deployment.Spec.Replicas))
+					continue
+				}
+
+				// Mark deployment as ready in this iteration
+				previouslyReady[deploymentName] = true
+				deploymentsReady++
 			}
 
 			// Log progress
@@ -333,8 +372,9 @@ func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, name
 			d.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)",
 				namespace, deploymentsReady, totalDeployments)
 
-			if len(notReadyDeployments) > 0 && len(notReadyDeployments) <= 5 {
-				d.log.Info("Deployments not yet ready: %s", strings.Join(notReadyDeployments, ", "))
+			// Log detailed status for not ready deployments
+			for name, reasons := range notReadyDeployments {
+				d.log.Info("Deployment %s not ready: %s", name, strings.Join(reasons, ", "))
 			}
 		}
 	}
@@ -371,4 +411,65 @@ func (d *DeploymentOperations) hasPrimaryCounterpart(ctx context.Context, namesp
 		return false, err
 	}
 	return true, nil
+}
+
+// isDeploymentReady checks if a deployment is ready
+func isDeploymentReady(deployment *appsv1.Deployment) bool {
+	return deployment.Status.ReadyReplicas == *deployment.Spec.Replicas &&
+		deployment.Status.UpdatedReplicas == *deployment.Spec.Replicas &&
+		deployment.Status.AvailableReplicas == *deployment.Spec.Replicas
+}
+
+// WaitForDeployments waits for all deployments in the specified namespaces to be ready
+func (o *DeploymentOperations) WaitForDeployments(ctx context.Context, namespaces []string) error {
+	o.log.Info("Waiting for deployments to be ready in namespaces: %v", namespaces)
+
+	// Get all deployments first
+	allDeployments := make(map[string][]string)
+	for _, ns := range namespaces {
+		deployments, err := o.clientset.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
+		}
+		allDeployments[ns] = make([]string, 0, len(deployments.Items))
+		for _, deployment := range deployments.Items {
+			allDeployments[ns] = append(allDeployments[ns], deployment.Name)
+		}
+	}
+
+	// Wait for all deployments to be ready
+	for _, ns := range namespaces {
+		deployments := allDeployments[ns]
+		if len(deployments) == 0 {
+			o.log.Info("No deployments found in namespace %s", ns)
+			continue
+		}
+
+		o.log.Info("Waiting for deployments to be ready in namespace %s (%d deployments)", ns, len(deployments))
+		readyCount := 0
+
+		for {
+			readyCount = 0
+			for _, deploymentName := range deployments {
+				deployment, err := o.clientset.AppsV1().Deployments(ns).Get(ctx, deploymentName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to get deployment %s/%s: %w", ns, deploymentName, err)
+				}
+
+				if isDeploymentReady(deployment) {
+					readyCount++
+				}
+			}
+
+			if readyCount == len(deployments) {
+				o.log.Info("All deployments are ready in namespace %s", ns)
+				break
+			}
+
+			o.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)", ns, readyCount, len(deployments))
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	return nil
 }
