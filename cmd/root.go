@@ -210,6 +210,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 			for _, ignore := range ignoreNS {
 				if ns == ignore {
 					shouldSkip = true
+					log.Warning("Namespace %s is in ignore list, skipping", ns)
 					break
 				}
 			}
@@ -218,6 +219,11 @@ func runRoot(cmd *cobra.Command, args []string) error {
 			}
 		}
 		namespaces = filteredNS
+
+		if len(namespaces) == 0 {
+			return fmt.Errorf("all specified namespaces are in ignore list. If you want to use these namespaces, please specify --ignore-namespaces=\"\"")
+		}
+
 		log.Info("Filtered namespaces (excluding %v): %v", ignoreNS, namespaces)
 	}
 
