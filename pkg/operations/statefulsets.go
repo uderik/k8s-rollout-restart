@@ -15,25 +15,29 @@ import (
 
 // StatefulSetOperations implements StatefulSetOperator interface
 type StatefulSetOperations struct {
-	clientset K8sClient
-	parallel  int
-	timeout   int
-	dryRun    bool
-	noFlagger bool
-	log       *logger.Logger
-	minAge    *time.Duration
+	clientset      K8sClient
+	parallel       int
+	timeout        int
+	dryRun         bool
+	noFlagger      bool
+	log            *logger.Logger
+	minAge         *time.Duration
+	podLabels      []string
+	podAnnotations []string
 }
 
 // NewStatefulSetOperations creates a new StatefulSetOperations instance
-func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration) *StatefulSetOperations {
+func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string) *StatefulSetOperations {
 	return &StatefulSetOperations{
-		clientset: clientset,
-		parallel:  parallel,
-		timeout:   timeout,
-		dryRun:    dryRun,
-		noFlagger: noFlagger,
-		log:       logger.NewLogger(dryRun),
-		minAge:    minAge,
+		clientset:      clientset,
+		parallel:       parallel,
+		timeout:        timeout,
+		dryRun:         dryRun,
+		noFlagger:      noFlagger,
+		log:            logger.NewLogger(dryRun),
+		minAge:         minAge,
+		podLabels:      podLabels,
+		podAnnotations: podAnnotations,
 	}
 }
 
@@ -103,6 +107,19 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 			if age < *s.minAge {
 				s.log.Info("Skipping StatefulSet %s/%s: too new (age: %s, required: %s)",
 					namespace, statefulset.Name, age.Round(time.Second), *s.minAge)
+				continue
+			}
+		}
+
+		// Check if StatefulSet has pods with required labels or annotations
+		if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
+			hasMatchingPods, err := s.hasPodsWithLabelsOrAnnotations(ctx, namespace, statefulset.Name)
+			if err != nil {
+				s.log.Warning("Failed to check pods for StatefulSet %s: %v", statefulset.Name, err)
+				continue
+			}
+			if !hasMatchingPods {
+				s.log.Info("Skipping StatefulSet %s: no pods with required labels or annotations", statefulset.Name)
 				continue
 			}
 		}
@@ -279,4 +296,174 @@ func (s *StatefulSetOperations) triggerStatefulSetRollout(ctx context.Context, n
 		return fmt.Errorf("failed to patch StatefulSet %s/%s: %w", namespace, name, err)
 	}
 	return nil
+}
+
+// hasPodsWithLabelsOrAnnotations checks if a StatefulSet has pods with the required labels or annotations
+func (s *StatefulSetOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace, statefulSetName string) (bool, error) {
+	// Get pods for this StatefulSet
+	pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", statefulSetName),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to list pods for StatefulSet %s: %w", statefulSetName, err)
+	}
+
+	// If no pods found, try alternative label selectors
+	if len(pods.Items) == 0 {
+		// Try with StatefulSet name as label
+		pods, err = s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("statefulset=%s", statefulSetName),
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to list pods for StatefulSet %s: %w", statefulSetName, err)
+		}
+	}
+
+	// If still no pods, try to find pods by owner reference
+	if len(pods.Items) == 0 {
+		allPods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, fmt.Errorf("failed to list all pods in namespace %s: %w", namespace, err)
+		}
+
+		// Find pods owned by this StatefulSet
+		for _, pod := range allPods.Items {
+			for _, owner := range pod.OwnerReferences {
+				if owner.Kind == "StatefulSet" && owner.Name == statefulSetName {
+					pods.Items = append(pods.Items, pod)
+				}
+			}
+		}
+	}
+
+	// Check if any pod has the required labels or annotations
+	for _, pod := range pods.Items {
+		if s.podHasRequiredLabels(pod.Labels) && s.podHasRequiredAnnotations(pod.Annotations) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// podHasRequiredLabels checks if a pod has all the required labels
+func (s *StatefulSetOperations) podHasRequiredLabels(podLabels map[string]string) bool {
+	// Parse required labels
+	requiredLabels := make(map[string]string)
+	for _, label := range s.podLabels {
+		parts := strings.Split(label, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		requiredLabels[parts[0]] = parts[1]
+	}
+
+	// Check if pod has all required labels
+	for key, value := range requiredLabels {
+		if podLabels[key] != value {
+			return false
+		}
+	}
+
+	return true
+}
+
+// podHasRequiredAnnotations checks if a pod has all the required annotations
+func (s *StatefulSetOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
+	// If no annotations required, return true
+	if len(s.podAnnotations) == 0 {
+		return true
+	}
+
+	// Parse required annotations
+	requiredAnnotations := make(map[string]string)
+	for _, annotation := range s.podAnnotations {
+		parts := strings.Split(annotation, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		requiredAnnotations[parts[0]] = parts[1]
+	}
+
+	// Check if pod has all required annotations
+	for key, value := range requiredAnnotations {
+		if podAnnotations[key] != value {
+			return false
+		}
+	}
+
+	return true
+}
+
+// GetStatefulSetsToRestart returns a list of statefulsets that would be restarted
+func (s *StatefulSetOperations) GetStatefulSetsToRestart(ctx context.Context, namespaces []string) ([]string, error) {
+	var allStatefulSets []string
+
+	for _, namespace := range namespaces {
+		statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list StatefulSets in namespace %s: %w", namespace, err)
+		}
+
+		// Get all pods in the namespace once for efficient filtering
+		var podsWithMatchingLabels []string
+		if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
+			allPods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+			}
+
+			// Create a map of statefulset names that have matching pods
+			statefulSetPods := make(map[string]bool)
+			for _, pod := range allPods.Items {
+				// Check if pod has required labels and annotations
+				if s.podHasRequiredLabels(pod.Labels) && s.podHasRequiredAnnotations(pod.Annotations) {
+					// Find which statefulset this pod belongs to
+					for _, owner := range pod.OwnerReferences {
+						if owner.Kind == "StatefulSet" {
+							statefulSetPods[owner.Name] = true
+						}
+					}
+				}
+			}
+			podsWithMatchingLabels = make([]string, 0, len(statefulSetPods))
+			for statefulSetName := range statefulSetPods {
+				podsWithMatchingLabels = append(podsWithMatchingLabels, statefulSetName)
+			}
+		}
+
+		// Apply the same filtering logic as in RestartStatefulSets
+		for _, statefulset := range statefulsets.Items {
+			// Skip StatefulSets managed by Zalando PostgreSQL Operator
+			if s.isPostgresOperatorStatefulSet(&statefulset) {
+				continue
+			}
+
+			// Apply age filter if specified
+			if s.minAge != nil {
+				age := time.Since(statefulset.CreationTimestamp.Time)
+				if age < *s.minAge {
+					continue
+				}
+			}
+
+			// Check if StatefulSet has pods with required labels or annotations
+			if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
+				hasMatchingPods := false
+				for _, statefulSetName := range podsWithMatchingLabels {
+					if statefulSetName == statefulset.Name {
+						hasMatchingPods = true
+						break
+					}
+				}
+				if !hasMatchingPods {
+					continue
+				}
+			}
+
+			allStatefulSets = append(allStatefulSets, fmt.Sprintf("%s/%s", namespace, statefulset.Name))
+		}
+	}
+
+	return allStatefulSets, nil
 }

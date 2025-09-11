@@ -20,12 +20,16 @@ type KafkaOperator interface {
 type DeploymentOperator interface {
 	// RestartDeployments restarts all deployments in the given namespaces
 	RestartDeployments(ctx context.Context, namespaces []string) error
+	// GetDeploymentsToRestart returns a list of deployments that would be restarted
+	GetDeploymentsToRestart(ctx context.Context, namespaces []string) ([]string, error)
 }
 
 // StatefulSetOperator defines the interface for statefulset operations
 type StatefulSetOperator interface {
 	// RestartStatefulSets restarts all statefulsets in the given namespaces
 	RestartStatefulSets(ctx context.Context, namespaces []string) error
+	// GetStatefulSetsToRestart returns a list of statefulsets that would be restarted
+	GetStatefulSetsToRestart(ctx context.Context, namespaces []string) ([]string, error)
 }
 
 // ClusterOperator defines the interface for cluster operations
@@ -85,6 +89,8 @@ type AppsV1Interface interface {
 	Deployments(namespace string) DeploymentInterface
 	// StatefulSets returns interface for working with statefulsets
 	StatefulSets(namespace string) StatefulSetInterface
+	// ReplicaSets returns interface for working with replicasets
+	ReplicaSets(namespace string) ReplicaSetInterface
 }
 
 // DeploymentInterface is an interface for deployment operations
@@ -109,4 +115,10 @@ type StatefulSetInterface interface {
 	Update(ctx context.Context, statefulset *appsv1.StatefulSet, opts metav1.UpdateOptions) (*appsv1.StatefulSet, error)
 	// Patch patches a statefulset
 	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*appsv1.StatefulSet, error)
+}
+
+// ReplicaSetInterface is an interface for replicaset operations
+type ReplicaSetInterface interface {
+	// Get returns a replicaset
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.ReplicaSet, error)
 }

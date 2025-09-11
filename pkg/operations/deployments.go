@@ -15,25 +15,29 @@ import (
 
 // DeploymentOperations implements DeploymentOperator interface
 type DeploymentOperations struct {
-	clientset K8sClient
-	parallel  int
-	timeout   int
-	dryRun    bool
-	noFlagger bool
-	log       *logger.Logger
-	minAge    *time.Duration
+	clientset      K8sClient
+	parallel       int
+	timeout        int
+	dryRun         bool
+	noFlagger      bool
+	log            *logger.Logger
+	minAge         *time.Duration
+	podLabels      []string
+	podAnnotations []string
 }
 
 // NewDeploymentOperations creates a new DeploymentOperations instance
-func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration) *DeploymentOperations {
+func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string) *DeploymentOperations {
 	return &DeploymentOperations{
-		clientset: clientset,
-		parallel:  parallel,
-		timeout:   timeout,
-		dryRun:    dryRun,
-		noFlagger: noFlagger,
-		log:       logger.NewLogger(dryRun),
-		minAge:    minAge,
+		clientset:      clientset,
+		parallel:       parallel,
+		timeout:        timeout,
+		dryRun:         dryRun,
+		noFlagger:      noFlagger,
+		log:            logger.NewLogger(dryRun),
+		minAge:         minAge,
+		podLabels:      podLabels,
+		podAnnotations: podAnnotations,
 	}
 }
 
@@ -98,6 +102,19 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 		if d.minAge != nil {
 			if time.Since(deployment.CreationTimestamp.Time) < *d.minAge {
 				tooYoungDeployments = append(tooYoungDeployments, deployment)
+				continue
+			}
+		}
+
+		// Check if deployment has pods with required labels or annotations
+		if len(d.podLabels) > 0 || len(d.podAnnotations) > 0 {
+			hasMatchingPods, err := d.hasPodsWithLabelsOrAnnotations(ctx, namespace, deployment.Name)
+			if err != nil {
+				d.log.Warning("Failed to check pods for deployment %s: %v", deployment.Name, err)
+				continue
+			}
+			if !hasMatchingPods {
+				d.log.Info("Skipping deployment %s: no pods with required labels or annotations", deployment.Name)
 				continue
 			}
 		}
@@ -472,4 +489,207 @@ func (o *DeploymentOperations) WaitForDeployments(ctx context.Context, namespace
 	}
 
 	return nil
+}
+
+// hasPodsWithLabelsOrAnnotations checks if a deployment has pods with the required labels or annotations
+func (d *DeploymentOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace, deploymentName string) (bool, error) {
+	// Get pods for this deployment
+	pods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", deploymentName),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to list pods for deployment %s: %w", deploymentName, err)
+	}
+
+	// If no pods found, try alternative label selectors
+	if len(pods.Items) == 0 {
+		// Try with deployment name as label
+		pods, err = d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("deployment=%s", deploymentName),
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to list pods for deployment %s: %w", deploymentName, err)
+		}
+	}
+
+	// If still no pods, try to find pods by owner reference
+	if len(pods.Items) == 0 {
+		allPods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, fmt.Errorf("failed to list all pods in namespace %s: %w", namespace, err)
+		}
+
+		// Find pods owned by this deployment
+		for _, pod := range allPods.Items {
+			for _, owner := range pod.OwnerReferences {
+				if owner.Kind == "ReplicaSet" {
+					// Check if this ReplicaSet is owned by our deployment
+					rs, err := d.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+					if err != nil {
+						continue
+					}
+					for _, rsOwner := range rs.OwnerReferences {
+						if rsOwner.Kind == "Deployment" && rsOwner.Name == deploymentName {
+							pods.Items = append(pods.Items, pod)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Check if any pod has the required labels or annotations
+	for _, pod := range pods.Items {
+		if d.podHasRequiredLabels(pod.Labels) && d.podHasRequiredAnnotations(pod.Annotations) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// podHasRequiredLabels checks if a pod has all the required labels
+func (d *DeploymentOperations) podHasRequiredLabels(podLabels map[string]string) bool {
+	// Parse required labels
+	requiredLabels := make(map[string]string)
+	for _, label := range d.podLabels {
+		parts := strings.Split(label, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		requiredLabels[parts[0]] = parts[1]
+	}
+
+	// Check if pod has all required labels
+	for key, value := range requiredLabels {
+		if podLabels[key] != value {
+			return false
+		}
+	}
+
+	return true
+}
+
+// podHasRequiredAnnotations checks if a pod has all the required annotations
+func (d *DeploymentOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
+	// If no annotations required, return true
+	if len(d.podAnnotations) == 0 {
+		return true
+	}
+
+	// Parse required annotations
+	requiredAnnotations := make(map[string]string)
+	for _, annotation := range d.podAnnotations {
+		parts := strings.Split(annotation, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		requiredAnnotations[parts[0]] = parts[1]
+	}
+
+	// Check if pod has all required annotations
+	for key, value := range requiredAnnotations {
+		if podAnnotations[key] != value {
+			return false
+		}
+	}
+
+	return true
+}
+
+// GetDeploymentsToRestart returns a list of deployments that would be restarted
+func (d *DeploymentOperations) GetDeploymentsToRestart(ctx context.Context, namespaces []string) ([]string, error) {
+	var allDeployments []string
+
+	for _, namespace := range namespaces {
+		deployments, err := d.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list deployments in namespace %s: %w", namespace, err)
+		}
+
+		// Get all pods in the namespace once for efficient filtering
+		var podsWithMatchingLabels []string
+		if len(d.podLabels) > 0 || len(d.podAnnotations) > 0 {
+			allPods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+			}
+
+			// Create a map of deployment names that have matching pods
+			deploymentPods := make(map[string]bool)
+			for _, pod := range allPods.Items {
+				// Check if pod has required labels and annotations
+				if d.podHasRequiredLabels(pod.Labels) && d.podHasRequiredAnnotations(pod.Annotations) {
+					// Find which deployment this pod belongs to
+					for _, owner := range pod.OwnerReferences {
+						if owner.Kind == "ReplicaSet" {
+							rs, err := d.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+							if err != nil {
+								continue
+							}
+							for _, rsOwner := range rs.OwnerReferences {
+								if rsOwner.Kind == "Deployment" {
+									deploymentPods[rsOwner.Name] = true
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+			podsWithMatchingLabels = make([]string, 0, len(deploymentPods))
+			for deploymentName := range deploymentPods {
+				podsWithMatchingLabels = append(podsWithMatchingLabels, deploymentName)
+			}
+		}
+
+		// Apply the same filtering logic as in RestartDeployments
+		for _, deployment := range deployments.Items {
+			// Check if deployment is old enough to restart
+			if d.minAge != nil {
+				if time.Since(deployment.CreationTimestamp.Time) < *d.minAge {
+					continue
+				}
+			}
+
+			// Check if deployment has pods with required labels or annotations
+			if len(d.podLabels) > 0 || len(d.podAnnotations) > 0 {
+				hasMatchingPods := false
+				for _, deploymentName := range podsWithMatchingLabels {
+					if deploymentName == deployment.Name {
+						hasMatchingPods = true
+						break
+					}
+				}
+				if !hasMatchingPods {
+					continue
+				}
+			}
+
+			// Apply Flagger logic
+			if !d.noFlagger {
+				// Check if this is a primary deployment
+				if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
+					allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
+					continue
+				}
+
+				// Check if this is a regular deployment without a primary counterpart
+				if !strings.HasSuffix(deployment.Name, "-primary") {
+					primaryName := deployment.Name + "-primary"
+					_, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, primaryName, metav1.GetOptions{})
+					if err != nil {
+						// No primary deployment found, this regular deployment will be restarted
+						allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
+					}
+				}
+			} else {
+				// If --no-flagger-filter is set, restart all deployments
+				allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
+			}
+		}
+	}
+
+	return allDeployments, nil
 }

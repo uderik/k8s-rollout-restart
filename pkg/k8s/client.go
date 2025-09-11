@@ -199,6 +199,12 @@ func (a *appsV1Adapter) StatefulSets(namespace string) operations.StatefulSetInt
 	}
 }
 
+func (a *appsV1Adapter) ReplicaSets(namespace string) operations.ReplicaSetInterface {
+	return &replicaSetAdapter{
+		replicasets: a.appsV1.ReplicaSets(namespace),
+	}
+}
+
 // deploymentAdapter adapts DeploymentInterface
 type deploymentAdapter struct {
 	deployments  typedappsv1.DeploymentInterface
@@ -243,4 +249,13 @@ func (a *statefulSetAdapter) Update(ctx context.Context, statefulset *appsv1.Sta
 
 func (a *statefulSetAdapter) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*appsv1.StatefulSet, error) {
 	return a.statefulsets.Patch(ctx, name, pt, data, opts)
+}
+
+// replicaSetAdapter adapts ReplicaSetInterface
+type replicaSetAdapter struct {
+	replicasets typedappsv1.ReplicaSetInterface
+}
+
+func (a *replicaSetAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.ReplicaSet, error) {
+	return a.replicasets.Get(ctx, name, opts)
 }

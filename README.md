@@ -208,6 +208,8 @@ go test -tags=integration ./...
 | `--exclude-node-labels` | Exclude nodes with these labels from cordon (format: key=value). Multiple labels can be specified comma-separated (default [eks.amazonaws.com/compute-type=fargate]) |
 | `--resources` | Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all) (default [deployments]) |
 | `--older-than` | Restart only resources older than specified duration (e.g. 24h, 30m, 7d) |
+| `--pod-labels` | Only restart resources that have pods with these labels (format: key=value). Multiple labels can be specified comma-separated |
+| `--pod-annotations` | Only restart resources that have pods with these annotations (format: key=value). Multiple annotations can be specified comma-separated |
 | `--kube-api-qps` | The maximum queries-per-second of requests sent to the Kubernetes API (default 50) |
 | `--kube-api-burst` | The maximum burst queries-per-second of requests sent to the Kubernetes API (default 300) |
 
@@ -231,7 +233,63 @@ go test -tags=integration ./...
 
 # Execute operations with node cordoning and excluding specific labels
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --cordon --exclude-node-labels=eks.amazonaws.com/compute-type=fargate,node-role.kubernetes.io/master=true --execute
+
+# Restart only resources with pods having specific labels (e.g., Istio canary deployments)
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=istio.io/rev=canary --execute
+
+# Restart only resources with pods having multiple labels
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=app=myapp,version=v1.0 --execute
+
+# Restart only resources with pods having specific labels and older than 1 hour
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=istio.io/rev=default --older-than=1h --execute
+
+# Restart only resources with pods having specific annotations (e.g., Istio canary deployments)
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --execute
+
+# Restart only resources with pods having multiple annotations
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary,deployment.kubernetes.io/revision=1 --execute
+
+# Restart only resources with both specific labels and annotations
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=app=myapp --pod-annotations=istio.io/rev=canary --execute
 ```
+
+## Pod Label Filter
+
+The utility supports restarting only resources that have pods with specific labels:
+
+- Use the `--pod-labels` flag to specify required pod labels (format: key=value)
+- Multiple labels can be specified comma-separated (e.g., `app=myapp,version=v1.0`)
+- Only resources with pods matching ALL specified labels will be restarted
+- This is particularly useful for:
+  - Istio canary deployments (`istio.io/rev=canary` or `istio.io/rev=default`)
+  - A/B testing scenarios
+  - Environment-specific filtering
+  - Version-based filtering
+- Can be combined with other filters like namespace, resource type, and age
+- The utility will automatically find pods associated with each resource through:
+  - Direct label selectors (`app=<resource-name>`)
+  - Owner references (for ReplicaSets and StatefulSets)
+  - Alternative label patterns
+
+## Pod Annotation Filter
+
+The utility supports restarting only resources that have pods with specific annotations:
+
+- Use the `--pod-annotations` flag to specify required pod annotations (format: key=value)
+- Multiple annotations can be specified comma-separated (e.g., `istio.io/rev=canary,deployment.kubernetes.io/revision=1`)
+- Only resources with pods matching ALL specified annotations will be restarted
+- This is particularly useful for:
+  - Istio canary deployments (using annotations instead of labels)
+  - Kubernetes deployment revisions (`deployment.kubernetes.io/revision`)
+  - Prometheus monitoring annotations (`prometheus.io/scrape=true`)
+  - Custom application annotations
+  - StatefulSet specific annotations (`statefulset.kubernetes.io/pod-name`)
+- Can be combined with other filters like namespace, resource type, age, and pod labels
+- The utility will automatically find pods associated with each resource through:
+  - Direct label selectors (`app=<resource-name>`)
+  - Owner references (for ReplicaSets and StatefulSets)
+  - Alternative label patterns
+- Both `--pod-labels` and `--pod-annotations` can be used together (AND logic)
 
 ## Older Than Filter
 
@@ -244,4 +302,4 @@ The utility supports restarting only resources that are older than a specified d
   - `d` for days (e.g., `7d` for 7 days)
 - Resources newer than the specified duration will be skipped
 - This is useful for avoiding restarts of recently deployed or updated resources
-- Can be combined with other filters like namespace and resource type 
+- Can be combined with other filters like namespace, resource type, and pod labels 

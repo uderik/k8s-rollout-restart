@@ -39,6 +39,8 @@ var (
 	nodeLabels     []string
 	excludeLabels  []string
 	clearCache     bool
+	podLabels      []string
+	podAnnotations []string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -98,6 +100,8 @@ func init() {
 	rootCmd.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Burst for Kubernetes API client")
 	rootCmd.Flags().StringSliceVar(&nodeLabels, "node-labels", []string{}, "Only cordon nodes with these labels (format: key=value). Multiple labels can be specified comma-separated.")
 	rootCmd.Flags().StringSliceVar(&excludeLabels, "exclude-node-labels", []string{"eks.amazonaws.com/compute-type=fargate"}, "Exclude nodes with these labels from cordon (format: key=value). Multiple labels can be specified comma-separated.")
+	rootCmd.Flags().StringSliceVar(&podLabels, "pod-labels", []string{}, "Only restart resources that have pods with these labels (format: key=value). Multiple labels can be specified comma-separated.")
+	rootCmd.Flags().StringSliceVar(&podAnnotations, "pod-annotations", []string{}, "Only restart resources that have pods with these annotations (format: key=value). Multiple annotations can be specified comma-separated.")
 	rootCmd.Flags().BoolVar(&clearCache, "clear-cache", false, "Clear Kubernetes client cache before execution")
 
 	// Mark execute and dry-run as mutually exclusive
@@ -220,8 +224,8 @@ func runRoot(cmd *cobra.Command, args []string) error {
 
 	// Create operations
 	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, noFlagger, dryRun)
-	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
-	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge)
+	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations)
+	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations)
 	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge)
 	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge)
 
@@ -239,12 +243,43 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	// If dry-run, just print the report and exit
 	if dryRun {
 		log.Info("Dry-run mode: would perform the following operations:")
+		
+		// Create context for dry-run operations
+		ctx := stdcontext.Background()
+		
+		// Get specific resources that would be restarted
 		if restartDeployments {
-			log.Info("  - Restart deployments in namespaces: %v", namespaces)
+			deploymentsToRestart, err := deploymentOps.GetDeploymentsToRestart(ctx, namespaces)
+			if err != nil {
+				log.Warning("Failed to get deployments to restart: %v", err)
+			} else {
+				if len(deploymentsToRestart) > 0 {
+					log.Info("  - Restart %d deployment(s):", len(deploymentsToRestart))
+					for _, deployment := range deploymentsToRestart {
+						log.Info("    * %s", deployment)
+					}
+				} else {
+					log.Info("  - No deployments to restart")
+				}
+			}
 		}
+		
 		if restartStatefulSets {
-			log.Info("  - Restart statefulsets in namespaces: %v", namespaces)
+			statefulSetsToRestart, err := statefulSetOps.GetStatefulSetsToRestart(ctx, namespaces)
+			if err != nil {
+				log.Warning("Failed to get statefulsets to restart: %v", err)
+			} else {
+				if len(statefulSetsToRestart) > 0 {
+					log.Info("  - Restart %d statefulset(s):", len(statefulSetsToRestart))
+					for _, statefulset := range statefulSetsToRestart {
+						log.Info("    * %s", statefulset)
+					}
+				} else {
+					log.Info("  - No statefulsets to restart")
+				}
+			}
 		}
+		
 		if restartKafka {
 			log.Info("  - Restart Kafka clusters in namespaces: %v", namespaces)
 		}
