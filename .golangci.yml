@@ -1,0 +1,49 @@
+version: 2
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # Use only important linters
+  disable-all: true
+  enable:
+    # Enabled by default - keep these
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    
+    # Additional useful ones
+    - misspell
+    - revive
+
+linters-settings:
+  govet:
+    # Disable shadow - too noisy
+    disable:
+      - shadow
+      
+  revive:
+    rules:
+      # Disable overly strict rules
+      - name: exported
+        disabled: true
+      - name: package-comments  
+        disabled: true
+
+issues:
+  # Exclude checks for test files
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - revive
+    # Exclude checks for cmd/root.go - cobra commands have specific patterns    
+    - path: cmd/root\.go
+      linters:
+        - errcheck
+  
+  max-issues-per-linter: 0
+  max-same-issues: 0

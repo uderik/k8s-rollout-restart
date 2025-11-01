@@ -1,3 +1,4 @@
+// Package main is the entry point for k8s-rollout-restart CLI application.
 package main
 
 import (

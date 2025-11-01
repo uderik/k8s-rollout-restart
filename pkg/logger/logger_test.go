@@ -29,15 +29,15 @@ func captureOutput(f func()) (string, string) {
 	f()
 
 	// Close writers and restore original stdout and stderr
-	wOut.Close()
-	wErr.Close()
+	_ = wOut.Close()
+	_ = wErr.Close()
 	os.Stdout = originalStdout
 	os.Stderr = originalStderr
 
 	// Read captured output
 	var bufOut, bufErr bytes.Buffer
-	io.Copy(&bufOut, rOut)
-	io.Copy(&bufErr, rErr)
+	_, _ = io.Copy(&bufOut, rOut)
+	_, _ = io.Copy(&bufErr, rErr)
 
 	return bufOut.String(), bufErr.String()
 }

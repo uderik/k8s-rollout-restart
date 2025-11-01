@@ -1,3 +1,4 @@
+// Package reporter provides cluster state reporting functionality.
 package reporter
 
 import (
@@ -94,13 +95,25 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 		statefulsets int
 		kafka        int
 		postgresql   int
+		usedNodes    map[string]bool // track nodes used by pods in this namespace
 		err          error
 	}
 
 	resultChan := make(chan namespaceResult, len(namespacesToCheck))
 	for _, ns := range namespacesToCheck {
 		go func(ns string) {
-			result := namespaceResult{ns: ns}
+			defer func() {
+				if r := recover(); r != nil {
+					resultChan <- namespaceResult{
+						ns:  ns,
+						err: fmt.Errorf("panic in namespace %s: %v", ns, r),
+					}
+				}
+			}()
+			result := namespaceResult{
+				ns:        ns,
+				usedNodes: make(map[string]bool),
+			}
 
 			// Get pods in namespace
 			pods, err := r.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
@@ -112,8 +125,10 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 
 			// Process pod info for this namespace
 			for _, pod := range pods.Items {
-				// Track nodes that have pods in our namespaces
-				usedNodes[pod.Spec.NodeName] = true
+				// Track nodes that have pods in this namespace
+				if pod.Spec.NodeName != "" {
+					result.usedNodes[pod.Spec.NodeName] = true
+				}
 
 				podInfo := PodState{
 					Name:     pod.Name,
@@ -197,6 +212,11 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 		report.Components.StatefulSets += result.statefulsets
 		report.Components.Kafka += result.kafka
 		report.Components.Postgresql += result.postgresql
+
+		// Merge used nodes from this namespace
+		for nodeName := range result.usedNodes {
+			usedNodes[nodeName] = true
+		}
 	}
 
 	// Add only nodes that have pods in our namespaces

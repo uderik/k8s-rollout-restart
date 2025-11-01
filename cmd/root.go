@@ -1,3 +1,4 @@
+// Package cmd contains CLI commands for k8s-rollout-restart.
 package cmd
 
 import (
@@ -71,7 +72,7 @@ func Execute() error {
 		if strings.Contains(err.Error(), "flag") || strings.Contains(err.Error(), "Usage:") {
 			// Для ошибок, связанных с флагами, выводим help
 			fmt.Fprintf(os.Stderr, "\n")
-			rootCmd.Help()
+			_ = rootCmd.Help()
 		}
 	}
 	return err
@@ -84,7 +85,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Preview operations without execution")
 	rootCmd.Flags().BoolVarP(&execute, "execute", "e", false, "Execute operations")
 	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context (required)")
-	rootCmd.MarkFlagRequired("context")
+	_ = rootCmd.MarkFlagRequired("context")
 	rootCmd.Flags().StringSliceVarP(&namespaces, "namespace", "n", []string{}, "Kubernetes namespace(s). Multiple namespaces can be specified comma-separated.")
 	rootCmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Process resources across all namespaces")
 	rootCmd.Flags().StringSliceVar(&ignoreNS, "ignore-namespaces", []string{"karpenter"}, "Namespaces to ignore. Multiple namespaces can be specified comma-separated.")
@@ -121,12 +122,10 @@ func initConfig() {
 
 	viper.AutomaticEnv()
 
-	if err := viper.ReadInConfig(); err == nil {
-		// Config file found and successfully parsed
-	}
+	_ = viper.ReadInConfig() // Config file is optional
 }
 
-func runRoot(cmd *cobra.Command, args []string) error {
+func runRoot(_ *cobra.Command, _ []string) error {
 	// Create logger first, to enable logging as early as possible
 	log := logger.NewLogger(dryRun)
 
@@ -137,7 +136,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 
 	// Verify context is specified
 	if ctxName == "" {
-		return fmt.Errorf("Kubernetes context must be specified using --context flag")
+		return fmt.Errorf("kubernetes context must be specified using --context flag")
 	}
 
 	// Immediately log the start of execution
@@ -217,7 +216,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	if olderThan != "" {
 		duration, err := parseDuration(olderThan)
 		if err != nil {
-			return fmt.Errorf("invalid older-than value: %v", err)
+			return fmt.Errorf("invalid older-than value: %w", err)
 		}
 		minAge = &duration
 	}
@@ -243,10 +242,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	// If dry-run, just print the report and exit
 	if dryRun {
 		log.Info("Dry-run mode: would perform the following operations:")
-		
+
 		// Create context for dry-run operations
 		ctx := stdcontext.Background()
-		
+
 		// Get specific resources that would be restarted
 		if restartDeployments {
 			deploymentsToRestart, err := deploymentOps.GetDeploymentsToRestart(ctx, namespaces)
@@ -263,7 +262,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
-		
+
 		if restartStatefulSets {
 			statefulSetsToRestart, err := statefulSetOps.GetStatefulSetsToRestart(ctx, namespaces)
 			if err != nil {
@@ -279,7 +278,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
-		
+
 		if restartKafka {
 			log.Info("  - Restart Kafka clusters in namespaces: %v", namespaces)
 		}

@@ -121,4 +121,6 @@ type StatefulSetInterface interface {
 type ReplicaSetInterface interface {
 	// Get returns a replicaset
 	Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.ReplicaSet, error)
+	// List returns a list of replicasets
+	List(ctx context.Context, opts metav1.ListOptions) (*appsv1.ReplicaSetList, error)
 }

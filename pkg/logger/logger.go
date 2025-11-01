@@ -1,3 +1,4 @@
+// Package logger provides structured logging functionality for k8s-rollout-restart.
 package logger
 
 import (
@@ -77,7 +78,7 @@ func (l *Logger) Info(format string, args ...interface{}) {
 		if l.dryRun {
 			prefix = "[DRY-RUN]"
 		}
-		infoColor.Fprintf(os.Stdout, "%s %s\n", prefix, message)
+		_, _ = infoColor.Fprintf(os.Stdout, "%s %s\n", prefix, message)
 	}
 }
 
@@ -91,7 +92,7 @@ func (l *Logger) Success(format string, args ...interface{}) {
 		if l.dryRun {
 			prefix = "[DRY-RUN]"
 		}
-		successColor.Fprintf(os.Stdout, "%s %s\n", prefix, message)
+		_, _ = successColor.Fprintf(os.Stdout, "%s %s\n", prefix, message)
 	}
 }
 
@@ -105,7 +106,7 @@ func (l *Logger) Warning(format string, args ...interface{}) {
 		if l.dryRun {
 			prefix = "[DRY-RUN]"
 		}
-		warningColor.Fprintf(os.Stdout, "%s %s\n", prefix, message)
+		_, _ = warningColor.Fprintf(os.Stdout, "%s %s\n", prefix, message)
 	}
 }
 
@@ -119,7 +120,7 @@ func (l *Logger) Error(format string, args ...interface{}) {
 		if l.dryRun {
 			prefix = "[DRY-RUN]"
 		}
-		errorColor.Fprintf(os.Stderr, "%s %s\n", prefix, message)
+		_, _ = errorColor.Fprintf(os.Stderr, "%s %s\n", prefix, message)
 	}
 }
 
@@ -146,6 +147,6 @@ func (l *Logger) logJSON(level LogLevel, message string) {
 	if level == ErrorLevel {
 		fmt.Fprintln(os.Stderr, string(jsonData))
 	} else {
-		fmt.Fprintln(os.Stdout, string(jsonData))
+		_, _ = fmt.Fprintln(os.Stdout, string(jsonData))
 	}
 }

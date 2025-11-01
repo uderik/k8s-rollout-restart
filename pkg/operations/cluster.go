@@ -336,16 +336,6 @@ func (c *ClusterOperations) uncordonNode(ctx context.Context, nodeName string) e
 	return nil
 }
 
-// hasPodFromNamespace checks if a node has pods from a namespace
-func (c *ClusterOperations) hasPodFromNamespace(nodeName string, pods []corev1.Pod) bool {
-	for _, pod := range pods {
-		if pod.Spec.NodeName == nodeName {
-			return true
-		}
-	}
-	return false
-}
-
 // hasPodFromNamespaces checks if a node has pods from any of the namespaces
 func (c *ClusterOperations) hasPodFromNamespaces(nodeName string, pods []corev1.Pod, namespaces []string) bool {
 	// Create a map for faster lookups

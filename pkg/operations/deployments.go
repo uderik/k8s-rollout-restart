@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
+	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,29 +16,51 @@ import (
 
 // DeploymentOperations implements DeploymentOperator interface
 type DeploymentOperations struct {
-	clientset      K8sClient
-	parallel       int
-	timeout        int
-	dryRun         bool
-	noFlagger      bool
-	log            *logger.Logger
-	minAge         *time.Duration
-	podLabels      []string
-	podAnnotations []string
+	clientset            K8sClient
+	parallel             int
+	timeout              int
+	dryRun               bool
+	noFlagger            bool
+	log                  *logger.Logger
+	minAge               *time.Duration
+	podLabels            []string
+	podAnnotations       []string
+	parsedPodLabels      map[string]string // cached parsed pod labels
+	parsedPodAnnotations map[string]string // cached parsed pod annotations
 }
 
 // NewDeploymentOperations creates a new DeploymentOperations instance
 func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string) *DeploymentOperations {
+	// Parse pod labels once during initialization
+	parsedLabels := make(map[string]string)
+	for _, label := range podLabels {
+		parts := strings.Split(label, "=")
+		if len(parts) == 2 {
+			parsedLabels[parts[0]] = parts[1]
+		}
+	}
+
+	// Parse pod annotations once during initialization
+	parsedAnnotations := make(map[string]string)
+	for _, annotation := range podAnnotations {
+		parts := strings.Split(annotation, "=")
+		if len(parts) == 2 {
+			parsedAnnotations[parts[0]] = parts[1]
+		}
+	}
+
 	return &DeploymentOperations{
-		clientset:      clientset,
-		parallel:       parallel,
-		timeout:        timeout,
-		dryRun:         dryRun,
-		noFlagger:      noFlagger,
-		log:            logger.NewLogger(dryRun),
-		minAge:         minAge,
-		podLabels:      podLabels,
-		podAnnotations: podAnnotations,
+		clientset:            clientset,
+		parallel:             parallel,
+		timeout:              timeout,
+		dryRun:               dryRun,
+		noFlagger:            noFlagger,
+		log:                  logger.NewLogger(dryRun),
+		minAge:               minAge,
+		podLabels:            podLabels,
+		podAnnotations:       podAnnotations,
+		parsedPodLabels:      parsedLabels,
+		parsedPodAnnotations: parsedAnnotations,
 	}
 }
 
@@ -48,30 +71,20 @@ func (d *DeploymentOperations) RestartDeployments(ctx context.Context, namespace
 		return nil
 	}
 
-	// For each namespace, restart deployments
-	var wg sync.WaitGroup
-	errorCh := make(chan error, len(namespaces))
+	// Use errgroup for better parallel error handling
+	g, ctx := errgroup.WithContext(ctx)
 
 	for _, ns := range namespaces {
-		ns := ns // Capture for goroutine
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		g.Go(func() error {
 			if err := d.restartDeploymentsInNamespace(ctx, ns); err != nil {
-				errorCh <- fmt.Errorf("failed to restart deployments in namespace %s: %w", ns, err)
+				return fmt.Errorf("failed to restart deployments in namespace %s: %w", ns, err)
 			}
-		}()
+			return nil
+		})
 	}
 
-	wg.Wait()
-	close(errorCh)
-
-	// Check for errors
-	for err := range errorCh {
-		return err // Return first error encountered
-	}
-
-	return nil
+	// Wait for all goroutines to complete and return first error if any
+	return g.Wait()
 }
 
 // restartDeploymentsInNamespace restarts all deployments in a single namespace
@@ -167,7 +180,7 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 	if d.dryRun {
 		d.log.Info("Deployments that would be restarted in namespace %s:", namespace)
 		for _, deployment := range deploymentsToRestart {
-			reason := ""
+			var reason string
 			if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
 				reason = "(Flagger primary deployment)"
 			} else {
@@ -216,7 +229,7 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 				_, err := d.clientset.AppsV1().Deployments(job.namespace).Patch(ctx, job.deployment.Name, types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
 				if err != nil {
 					workerErrCh <- fmt.Errorf("failed to patch deployment %s/%s: %w", job.namespace, job.deployment.Name, err)
-					return
+					continue // Continue processing other jobs instead of returning
 				}
 
 				d.log.Success("Successfully restarted deployment %s/%s", job.namespace, job.deployment.Name)
@@ -226,7 +239,7 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 
 	// Send jobs to workers
 	for _, deployment := range deploymentsToRestart {
-		reason := ""
+		var reason string
 		if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
 			reason = "(Flagger primary deployment)"
 		} else {
@@ -243,9 +256,15 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 	workerWg.Wait()
 	close(workerErrCh)
 
-	// Check for errors
+	// Collect all errors
+	var errors []error
 	for err := range workerErrCh {
-		return err // Return first error encountered
+		errors = append(errors, err)
+	}
+
+	// Return combined error if any errors occurred
+	if len(errors) > 0 {
+		return fmt.Errorf("errors during deployment restart: %v", errors)
 	}
 
 	if len(skippedDeployments) > 0 {
@@ -303,10 +322,8 @@ func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, name
 
 			// Check each deployment
 			for deploymentName := range deploymentGenerations {
-				// Disable caching to get fresh data
-				deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{
-					ResourceVersion: "0", // Force fresh data
-				})
+				// Get deployment status (cache manager will handle freshness with TTL)
+				deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
 				if err != nil {
 					d.log.Warning("Failed to get deployment %s/%s: %v", namespace, deploymentName, err)
 					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName], "Failed to get deployment status")
@@ -337,6 +354,8 @@ func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, name
 							notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
 								fmt.Sprintf("Replica failure: %s", condition.Message))
 						}
+					case appsv1.DeploymentAvailable:
+						// DeploymentAvailable condition is informational, no action needed
 					}
 				}
 
@@ -409,27 +428,6 @@ func (d *DeploymentOperations) hasFlaggerCanaryOwner(deployment appsv1.Deploymen
 	return false
 }
 
-// isFlaggerPrimaryDeployment checks if the deployment is a Flagger primary deployment
-// A Flagger primary deployment has a -primary suffix and is owned by a Flagger Canary resource
-func (d *DeploymentOperations) isFlaggerPrimaryDeployment(deployment appsv1.Deployment) bool {
-	// Check for Flagger Canary owner reference AND -primary suffix
-	return d.hasFlaggerCanaryOwner(deployment) && strings.HasSuffix(deployment.Name, "-primary")
-}
-
-// hasPrimaryCounterpart checks if a deployment has a primary counterpart
-// by looking for a deployment with the same name plus "-primary" suffix
-func (d *DeploymentOperations) hasPrimaryCounterpart(ctx context.Context, namespace, name string) (bool, error) {
-	primaryName := name + "-primary"
-	_, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, primaryName, metav1.GetOptions{})
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
 // isDeploymentReady checks if a deployment is ready
 func isDeploymentReady(deployment *appsv1.Deployment) bool {
 	return deployment.Status.ReadyReplicas == *deployment.Spec.Replicas &&
@@ -438,13 +436,13 @@ func isDeploymentReady(deployment *appsv1.Deployment) bool {
 }
 
 // WaitForDeployments waits for all deployments in the specified namespaces to be ready
-func (o *DeploymentOperations) WaitForDeployments(ctx context.Context, namespaces []string) error {
-	o.log.Info("Waiting for deployments to be ready in namespaces: %v", namespaces)
+func (d *DeploymentOperations) WaitForDeployments(ctx context.Context, namespaces []string) error {
+	d.log.Info("Waiting for deployments to be ready in namespaces: %v", namespaces)
 
 	// Get all deployments first
 	allDeployments := make(map[string][]string)
 	for _, ns := range namespaces {
-		deployments, err := o.clientset.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+		deployments, err := d.clientset.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
 		}
@@ -458,17 +456,16 @@ func (o *DeploymentOperations) WaitForDeployments(ctx context.Context, namespace
 	for _, ns := range namespaces {
 		deployments := allDeployments[ns]
 		if len(deployments) == 0 {
-			o.log.Info("No deployments found in namespace %s", ns)
+			d.log.Info("No deployments found in namespace %s", ns)
 			continue
 		}
 
-		o.log.Info("Waiting for deployments to be ready in namespace %s (%d deployments)", ns, len(deployments))
-		readyCount := 0
+		d.log.Info("Waiting for deployments to be ready in namespace %s (%d deployments)", ns, len(deployments))
 
 		for {
-			readyCount = 0
+			readyCount := 0
 			for _, deploymentName := range deployments {
-				deployment, err := o.clientset.AppsV1().Deployments(ns).Get(ctx, deploymentName, metav1.GetOptions{})
+				deployment, err := d.clientset.AppsV1().Deployments(ns).Get(ctx, deploymentName, metav1.GetOptions{})
 				if err != nil {
 					return fmt.Errorf("failed to get deployment %s/%s: %w", ns, deploymentName, err)
 				}
@@ -479,11 +476,11 @@ func (o *DeploymentOperations) WaitForDeployments(ctx context.Context, namespace
 			}
 
 			if readyCount == len(deployments) {
-				o.log.Info("All deployments are ready in namespace %s", ns)
+				d.log.Info("All deployments are ready in namespace %s", ns)
 				break
 			}
 
-			o.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)", ns, readyCount, len(deployments))
+			d.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)", ns, readyCount, len(deployments))
 			time.Sleep(5 * time.Second)
 		}
 	}
@@ -493,33 +490,29 @@ func (o *DeploymentOperations) WaitForDeployments(ctx context.Context, namespace
 
 // hasPodsWithLabelsOrAnnotations checks if a deployment has pods with the required labels or annotations
 func (d *DeploymentOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace, deploymentName string) (bool, error) {
-	// Get pods for this deployment
+	// Get the deployment to access its selector
+	deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to get deployment %s: %w", deploymentName, err)
+	}
+
+	// Use the deployment's selector to find its pods
+	labelSelector := metav1.FormatLabelSelector(deployment.Spec.Selector)
 	pods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", deploymentName),
+		LabelSelector: labelSelector,
 	})
 	if err != nil {
 		return false, fmt.Errorf("failed to list pods for deployment %s: %w", deploymentName, err)
 	}
 
-	// If no pods found, try alternative label selectors
-	if len(pods.Items) == 0 {
-		// Try with deployment name as label
-		pods, err = d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("deployment=%s", deploymentName),
-		})
-		if err != nil {
-			return false, fmt.Errorf("failed to list pods for deployment %s: %w", deploymentName, err)
-		}
-	}
-
-	// If still no pods, try to find pods by owner reference
+	// If no pods found, try to find pods by owner reference as fallback
 	if len(pods.Items) == 0 {
 		allPods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return false, fmt.Errorf("failed to list all pods in namespace %s: %w", namespace, err)
 		}
 
-		// Find pods owned by this deployment
+		// Find pods owned by this deployment through ReplicaSets
 		for _, pod := range allPods.Items {
 			for _, owner := range pod.OwnerReferences {
 				if owner.Kind == "ReplicaSet" {
@@ -551,14 +544,22 @@ func (d *DeploymentOperations) hasPodsWithLabelsOrAnnotations(ctx context.Contex
 
 // podHasRequiredLabels checks if a pod has all the required labels
 func (d *DeploymentOperations) podHasRequiredLabels(podLabels map[string]string) bool {
-	// Parse required labels
-	requiredLabels := make(map[string]string)
-	for _, label := range d.podLabels {
-		parts := strings.Split(label, "=")
-		if len(parts) != 2 {
-			continue
+	// Use parsed labels if available (from constructor), otherwise parse on the fly (for tests)
+	requiredLabels := d.parsedPodLabels
+	if len(requiredLabels) == 0 && len(d.podLabels) > 0 {
+		// Fallback: parse labels on the fly for backward compatibility
+		requiredLabels = make(map[string]string)
+		for _, label := range d.podLabels {
+			parts := strings.Split(label, "=")
+			if len(parts) == 2 {
+				requiredLabels[parts[0]] = parts[1]
+			}
 		}
-		requiredLabels[parts[0]] = parts[1]
+	}
+
+	// If no labels required, return true
+	if len(requiredLabels) == 0 {
+		return true
 	}
 
 	// Check if pod has all required labels
@@ -573,19 +574,22 @@ func (d *DeploymentOperations) podHasRequiredLabels(podLabels map[string]string)
 
 // podHasRequiredAnnotations checks if a pod has all the required annotations
 func (d *DeploymentOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
-	// If no annotations required, return true
-	if len(d.podAnnotations) == 0 {
-		return true
+	// Use parsed annotations if available (from constructor), otherwise parse on the fly (for tests)
+	requiredAnnotations := d.parsedPodAnnotations
+	if len(requiredAnnotations) == 0 && len(d.podAnnotations) > 0 {
+		// Fallback: parse annotations on the fly for backward compatibility
+		requiredAnnotations = make(map[string]string)
+		for _, annotation := range d.podAnnotations {
+			parts := strings.Split(annotation, "=")
+			if len(parts) == 2 {
+				requiredAnnotations[parts[0]] = parts[1]
+			}
+		}
 	}
 
-	// Parse required annotations
-	requiredAnnotations := make(map[string]string)
-	for _, annotation := range d.podAnnotations {
-		parts := strings.Split(annotation, "=")
-		if len(parts) != 2 {
-			continue
-		}
-		requiredAnnotations[parts[0]] = parts[1]
+	// If no annotations required, return true
+	if len(requiredAnnotations) == 0 {
+		return true
 	}
 
 	// Check if pod has all required annotations
@@ -616,6 +620,23 @@ func (d *DeploymentOperations) GetDeploymentsToRestart(ctx context.Context, name
 				return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
 			}
 
+			// Get all ReplicaSets in the namespace once to avoid multiple API calls
+			allReplicaSets, err := d.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to list replicasets in namespace %s: %w", namespace, err)
+			}
+
+			// Create a map of ReplicaSet name -> Deployment name
+			rsToDeployment := make(map[string]string)
+			for _, rs := range allReplicaSets.Items {
+				for _, owner := range rs.OwnerReferences {
+					if owner.Kind == "Deployment" {
+						rsToDeployment[rs.Name] = owner.Name
+						break
+					}
+				}
+			}
+
 			// Create a map of deployment names that have matching pods
 			deploymentPods := make(map[string]bool)
 			for _, pod := range allPods.Items {
@@ -624,15 +645,8 @@ func (d *DeploymentOperations) GetDeploymentsToRestart(ctx context.Context, name
 					// Find which deployment this pod belongs to
 					for _, owner := range pod.OwnerReferences {
 						if owner.Kind == "ReplicaSet" {
-							rs, err := d.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
-							if err != nil {
-								continue
-							}
-							for _, rsOwner := range rs.OwnerReferences {
-								if rsOwner.Kind == "Deployment" {
-									deploymentPods[rsOwner.Name] = true
-									break
-								}
+							if deploymentName, exists := rsToDeployment[owner.Name]; exists {
+								deploymentPods[deploymentName] = true
 							}
 						}
 					}
@@ -677,9 +691,16 @@ func (d *DeploymentOperations) GetDeploymentsToRestart(ctx context.Context, name
 
 				// Check if this is a regular deployment without a primary counterpart
 				if !strings.HasSuffix(deployment.Name, "-primary") {
+					// Check if this deployment has a primary counterpart in the already loaded deployments
 					primaryName := deployment.Name + "-primary"
-					_, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, primaryName, metav1.GetOptions{})
-					if err != nil {
+					hasPrimary := false
+					for _, existingDeployment := range deployments.Items {
+						if existingDeployment.Name == primaryName {
+							hasPrimary = true
+							break
+						}
+					}
+					if !hasPrimary {
 						// No primary deployment found, this regular deployment will be restarted
 						allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
 					}

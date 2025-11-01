@@ -1,3 +1,4 @@
+// Package k8s provides Kubernetes client functionality with caching.
 package k8s
 
 import (
@@ -43,11 +44,13 @@ type cacheEntry struct {
 
 type deploymentCacheEntry struct {
 	cacheEntry
+
 	namespace string
 }
 
 type statefulSetCacheEntry struct {
 	cacheEntry
+
 	namespace string
 }
 

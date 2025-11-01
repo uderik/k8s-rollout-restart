@@ -217,6 +217,11 @@ func (a *deploymentAdapter) List(ctx context.Context, opts metav1.ListOptions) (
 }
 
 func (a *deploymentAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.Deployment, error) {
+	// If specific ResourceVersion requested, bypass cache
+	if opts.ResourceVersion != "" && opts.ResourceVersion != "0" {
+		return a.deployments.Get(ctx, name, opts)
+	}
+	// Use cache for normal requests
 	return a.cacheManager.GetDeployment(ctx, a.namespace, name)
 }
 
@@ -240,6 +245,11 @@ func (a *statefulSetAdapter) List(ctx context.Context, opts metav1.ListOptions) 
 }
 
 func (a *statefulSetAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error) {
+	// If specific ResourceVersion requested, bypass cache
+	if opts.ResourceVersion != "" && opts.ResourceVersion != "0" {
+		return a.statefulsets.Get(ctx, name, opts)
+	}
+	// Use cache for normal requests
 	return a.cacheManager.GetStatefulSet(ctx, a.namespace, name)
 }
 
@@ -258,4 +268,8 @@ type replicaSetAdapter struct {
 
 func (a *replicaSetAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.ReplicaSet, error) {
 	return a.replicasets.Get(ctx, name, opts)
+}
+
+func (a *replicaSetAdapter) List(ctx context.Context, opts metav1.ListOptions) (*appsv1.ReplicaSetList, error) {
+	return a.replicasets.List(ctx, opts)
 }

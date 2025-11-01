@@ -52,7 +52,6 @@ func (k *KafkaOperations) RestartKafkaClusters(ctx context.Context, namespaces [
 	clusterFoundCh := make(chan bool, len(namespaces))
 
 	for _, ns := range namespaces {
-		ns := ns // Capture for goroutine
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -266,52 +265,6 @@ func (k *KafkaOperations) restartKafkaClustersInNamespace(ctx context.Context, n
 	}
 
 	return true, nil
-}
-
-// waitForKafkaPods waits for all Kafka pods to be running
-func (k *KafkaOperations) waitForKafkaPods(ctx context.Context, namespace string) error {
-	k.log.Info("Waiting for Kafka pods in namespace %s to be ready", namespace)
-
-	// Wait for up to 10 minutes
-	timeout := 10 * time.Minute
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Check every 10 seconds
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timeout waiting for Kafka pods to be ready in namespace %s", namespace)
-		case <-ticker.C:
-			// Get Kafka pods
-			pods, err := k.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-				LabelSelector: "strimzi.io/kind=Kafka",
-			})
-			if err != nil {
-				k.log.Warning("Failed to list Kafka pods: %v", err)
-				continue
-			}
-
-			// Check if all pods are running
-			allRunning := true
-			for _, pod := range pods.Items {
-				if pod.Status.Phase != "Running" {
-					allRunning = false
-					break
-				}
-			}
-
-			if allRunning && len(pods.Items) > 0 {
-				k.log.Success("All Kafka pods are running in namespace %s", namespace)
-				return nil
-			}
-
-			k.log.Info("Still waiting for Kafka pods to be ready in namespace %s", namespace)
-		}
-	}
 }
 
 // checkStrimziPodSetAPIExists checks if the StrimziPodSet API is available

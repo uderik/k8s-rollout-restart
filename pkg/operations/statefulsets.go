@@ -53,7 +53,6 @@ func (s *StatefulSetOperations) RestartStatefulSets(ctx context.Context, namespa
 	errorCh := make(chan error, len(namespaces))
 
 	for _, ns := range namespaces {
-		ns := ns // Capture for goroutine
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -60,7 +60,6 @@ func (p *PostgresqlOperations) RestartPostgresqlClusters(ctx context.Context, na
 	emptyNamespacesCh := make(chan string, len(namespaces))
 
 	for _, ns := range namespaces {
-		ns := ns // Capture for goroutine
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

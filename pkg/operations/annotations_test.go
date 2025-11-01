@@ -1,3 +1,4 @@
+// Package operations provides tests for annotation-based filtering functionality.
 package operations
 
 import (
