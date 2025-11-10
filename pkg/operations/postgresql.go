@@ -265,13 +265,14 @@ func (p *PostgresqlOperations) restartPostgresqlClustersInNamespace(ctx context.
 // applyRestartAnnotation adds the restart annotation to a PostgreSQL cluster
 func (p *PostgresqlOperations) applyRestartAnnotation(ctx context.Context, namespace, name string) error {
 	// Define the annotation to trigger a rolling update
-	// For Zalando Postgres Operator, we'll use the standard timestamp annotation pattern
+	// For Zalando Postgres Operator, we need to modify spec.podAnnotations
+	// This will cause the operator to update the StatefulSet and trigger a rolling restart
 	restartTimestamp := time.Now().Format(time.RFC3339)
 
 	patchData := map[string]interface{}{
-		"metadata": map[string]interface{}{
-			"annotations": map[string]string{
-				"zalando.org/postgres-operator-restart": restartTimestamp,
+		"spec": map[string]interface{}{
+			"podAnnotations": map[string]string{
+				"zalando.org/restartedAt": restartTimestamp,
 			},
 		},
 	}

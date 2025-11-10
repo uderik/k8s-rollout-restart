@@ -38,11 +38,12 @@ type PodState struct {
 
 // ComponentState represents the state of cluster components
 type ComponentState struct {
-	Deployments  int `json:"deployments"`
-	StatefulSets int `json:"statefulSets"`
-	DaemonSets   int `json:"daemonSets"`
-	Kafka        int `json:"kafka"`
-	Postgresql   int `json:"postgresql"`
+	Deployments   int `json:"deployments"`
+	StatefulSets  int `json:"statefulSets"`
+	DaemonSets    int `json:"daemonSets"`
+	Kafka         int `json:"kafka"`
+	Postgresql    int `json:"postgresql"`
+	Elasticsearch int `json:"elasticsearch"`
 }
 
 // Reporter handles cluster state reporting
@@ -89,14 +90,15 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 
 	// Process each namespace in parallel
 	type namespaceResult struct {
-		ns           string
-		pods         []PodState
-		deployments  int
-		statefulsets int
-		kafka        int
-		postgresql   int
-		usedNodes    map[string]bool // track nodes used by pods in this namespace
-		err          error
+		ns            string
+		pods          []PodState
+		deployments   int
+		statefulsets  int
+		kafka         int
+		postgresql    int
+		elasticsearch int
+		usedNodes     map[string]bool // track nodes used by pods in this namespace
+		err           error
 	}
 
 	resultChan := make(chan namespaceResult, len(namespacesToCheck))
@@ -196,6 +198,25 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 				}
 			}
 
+			// Count Elasticsearch resources if available
+			elasticsearchList, err := r.client.RESTClient().Get().
+				AbsPath("/apis/elasticsearch.k8s.elastic.co/v1").
+				Namespace(ns).
+				Resource("elasticsearches").
+				DoRaw(ctx)
+			if err == nil {
+				var elasticsearchResult struct {
+					Items []struct {
+						Metadata struct {
+							Name string `json:"name"`
+						} `json:"metadata"`
+					} `json:"items"`
+				}
+				if err := json.Unmarshal(elasticsearchList, &elasticsearchResult); err == nil {
+					result.elasticsearch = len(elasticsearchResult.Items)
+				}
+			}
+
 			resultChan <- result
 		}(ns)
 	}
@@ -212,6 +233,7 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 		report.Components.StatefulSets += result.statefulsets
 		report.Components.Kafka += result.kafka
 		report.Components.Postgresql += result.postgresql
+		report.Components.Elasticsearch += result.elasticsearch
 
 		// Merge used nodes from this namespace
 		for nodeName := range result.usedNodes {

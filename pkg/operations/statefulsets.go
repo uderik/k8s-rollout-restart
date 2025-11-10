@@ -90,6 +90,7 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 	// Track which StatefulSets we'll restart and which we'll skip
 	var toRestart []appsv1.StatefulSet
 	var postgresOperatorStatefulSets []string
+	var elasticsearchStatefulSets []string
 
 	// Filter StatefulSets
 	for _, statefulset := range statefulsets.Items {
@@ -97,6 +98,13 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 		if s.isPostgresOperatorStatefulSet(&statefulset) {
 			postgresOperatorStatefulSets = append(postgresOperatorStatefulSets,
 				fmt.Sprintf("%s (controlled by Zalando PostgreSQL Operator)", statefulset.Name))
+			continue
+		}
+
+		// Skip Elasticsearch StatefulSets
+		if s.isElasticsearchStatefulSet(&statefulset) {
+			elasticsearchStatefulSets = append(elasticsearchStatefulSets,
+				fmt.Sprintf("%s (Elasticsearch cluster)", statefulset.Name))
 			continue
 		}
 
@@ -130,6 +138,14 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 	if len(postgresOperatorStatefulSets) > 0 {
 		s.log.Info("Skipping the following StatefulSets in namespace %s (will be restarted via PostgreSQL Operator):", namespace)
 		for _, name := range postgresOperatorStatefulSets {
+			s.log.Info("- %s", name)
+		}
+	}
+
+	// Log the skipped Elasticsearch StatefulSets
+	if len(elasticsearchStatefulSets) > 0 {
+		s.log.Info("Skipping the following Elasticsearch StatefulSets in namespace %s:", namespace)
+		for _, name := range elasticsearchStatefulSets {
 			s.log.Info("- %s", name)
 		}
 	}
@@ -286,6 +302,33 @@ func (s *StatefulSetOperations) isPostgresOperatorStatefulSet(statefulset *appsv
 	return false
 }
 
+// isElasticsearchStatefulSet checks if the statefulset is part of an Elasticsearch cluster
+func (s *StatefulSetOperations) isElasticsearchStatefulSet(statefulset *appsv1.StatefulSet) bool {
+	// Check for Elastic Cloud on Kubernetes (ECK) operator labels
+	if value, exists := statefulset.Labels["common.k8s.elastic.co/type"]; exists && value == "elasticsearch" {
+		return true
+	}
+
+	// Check for ECK cluster-name label
+	if _, exists := statefulset.Labels["elasticsearch.k8s.elastic.co/cluster-name"]; exists {
+		return true
+	}
+
+	// Check if StatefulSet name contains "elasticsearch"
+	if strings.Contains(strings.ToLower(statefulset.Name), "elasticsearch") {
+		return true
+	}
+
+	// Check for app label with elasticsearch value
+	if value, exists := statefulset.Labels["app"]; exists {
+		if strings.Contains(strings.ToLower(value), "elasticsearch") {
+			return true
+		}
+	}
+
+	return false
+}
+
 // triggerStatefulSetRollout triggers a rollout for a StatefulSet by adding a restart annotation
 func (s *StatefulSetOperations) triggerStatefulSetRollout(ctx context.Context, namespace, name string) error {
 	// Patch statefulset to trigger a rolling update
@@ -435,6 +478,11 @@ func (s *StatefulSetOperations) GetStatefulSetsToRestart(ctx context.Context, na
 		for _, statefulset := range statefulsets.Items {
 			// Skip StatefulSets managed by Zalando PostgreSQL Operator
 			if s.isPostgresOperatorStatefulSet(&statefulset) {
+				continue
+			}
+
+			// Skip Elasticsearch StatefulSets
+			if s.isElasticsearchStatefulSet(&statefulset) {
 				continue
 			}
 

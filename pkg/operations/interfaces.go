@@ -16,6 +16,12 @@ type KafkaOperator interface {
 	RestartKafkaClusters(ctx context.Context, namespaces []string) error
 }
 
+// ElasticsearchOperator defines the interface for Elasticsearch cluster operations
+type ElasticsearchOperator interface {
+	// RestartElasticsearchClusters restarts all Elasticsearch clusters in the given namespaces
+	RestartElasticsearchClusters(ctx context.Context, namespaces []string) error
+}
+
 // DeploymentOperator defines the interface for deployment operations
 type DeploymentOperator interface {
 	// RestartDeployments restarts all deployments in the given namespaces

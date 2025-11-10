@@ -95,7 +95,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&noFlagger, "no-flagger-filter", false, "Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)")
 	rootCmd.Flags().BoolVar(&doCordon, "cordon", false, "Whether to cordon nodes before restart (if not set, nodes will not be cordoned)")
 	rootCmd.Flags().BoolVar(&cordonAllNodes, "cordon-all-nodes", false, "Cordon all nodes in the cluster, not just those with pods from specified namespaces")
-	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, all)")
+	rootCmd.Flags().StringSliceVar(&resourceTypes, "resources", []string{"deployments"}, "Resource types to restart (deployments, statefulsets, strimzi-kafka, zalando-postgresql, elasticsearch, all)")
 	rootCmd.Flags().StringVar(&olderThan, "older-than", "", "Restart only resources older than specified duration (e.g. 24h, 30m, 7d)")
 	rootCmd.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 20, "QPS for Kubernetes API client")
 	rootCmd.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Burst for Kubernetes API client")
@@ -153,7 +153,7 @@ func runRoot(_ *cobra.Command, _ []string) error {
 
 	// Validate resource types first, before any expensive operations
 	log.Info("Validating resource types")
-	var restartDeployments, restartStatefulSets, restartKafka, restartPostgresql bool
+	var restartDeployments, restartStatefulSets, restartKafka, restartPostgresql, restartElasticsearch bool
 	for _, resourceType := range resourceTypes {
 		switch resourceType {
 		case "deployments":
@@ -164,11 +164,14 @@ func runRoot(_ *cobra.Command, _ []string) error {
 			restartKafka = true
 		case "zalando-postgresql":
 			restartPostgresql = true
+		case "elasticsearch":
+			restartElasticsearch = true
 		case "all":
 			restartDeployments = true
 			restartStatefulSets = true
 			restartKafka = true
 			restartPostgresql = true
+			restartElasticsearch = true
 		default:
 			return fmt.Errorf("invalid resource type: %s", resourceType)
 		}
@@ -227,6 +230,7 @@ func runRoot(_ *cobra.Command, _ []string) error {
 	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations)
 	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge)
 	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge)
+	elasticsearchOps := operations.NewElasticsearchOperations(k8sClient, parallel, timeout, dryRun, minAge)
 
 	// Initialize reporter
 	log.Info("Initializing reporter")
@@ -285,6 +289,9 @@ func runRoot(_ *cobra.Command, _ []string) error {
 		if restartPostgresql {
 			log.Info("  - Restart PostgreSQL clusters in namespaces: %v", namespaces)
 		}
+		if restartElasticsearch {
+			log.Info("  - Restart Elasticsearch clusters in namespaces: %v", namespaces)
+		}
 		if doCordon {
 			log.Info("  - Cordon nodes with pods from namespaces: %v", namespaces)
 		}
@@ -310,6 +317,9 @@ func runRoot(_ *cobra.Command, _ []string) error {
 			}
 			if restartPostgresql {
 				components = append(components, fmt.Sprintf("PostgreSQL: %d", initialReport.Components.Postgresql))
+			}
+			if restartElasticsearch {
+				components = append(components, fmt.Sprintf("Elasticsearch: %d", initialReport.Components.Elasticsearch))
 			}
 			log.Info("Nodes: %d, %s, Unschedulable: %d",
 				len(initialReport.Nodes),
@@ -355,6 +365,13 @@ func runRoot(_ *cobra.Command, _ []string) error {
 		}
 	}
 
+	if restartElasticsearch {
+		log.Info("Restarting Elasticsearch clusters")
+		if err := elasticsearchOps.RestartElasticsearchClusters(stdcontext.Background(), namespaces); err != nil {
+			return fmt.Errorf("failed to restart Elasticsearch clusters: %w", err)
+		}
+	}
+
 	// Generate final report
 	log.Info("Generating final report")
 	finalReport, err := reporter.GenerateReport(stdcontext.Background(), namespaces)
@@ -383,6 +400,9 @@ func runRoot(_ *cobra.Command, _ []string) error {
 		}
 		if restartPostgresql {
 			components = append(components, fmt.Sprintf("PostgreSQL: %d", finalReport.Components.Postgresql))
+		}
+		if restartElasticsearch {
+			components = append(components, fmt.Sprintf("Elasticsearch: %d", finalReport.Components.Elasticsearch))
 		}
 		log.Info("Nodes: %d, %s, Unschedulable: %d",
 			len(finalReport.Nodes),

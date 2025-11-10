@@ -221,7 +221,9 @@ func (k *KafkaOperations) restartKafkaClustersInNamespace(ctx context.Context, n
 		podSetNames := []string{
 			// Kafka brokers
 			fmt.Sprintf("%s-kafka", kafkaName),
-			// Zookeeper
+			// KRaft controllers (KRaft mode)
+			fmt.Sprintf("%s-kafka-controller", kafkaName),
+			// Zookeeper (ZooKeeper mode)
 			fmt.Sprintf("%s-zookeeper", kafkaName),
 			// Kafka Connect (optional)
 			fmt.Sprintf("%s-connect", kafkaName),
