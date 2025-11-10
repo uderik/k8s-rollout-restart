@@ -179,7 +179,12 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 	// Wait for all StatefulSets to be ready if there are any
 	if len(toRestart) > 0 {
 		s.log.Info("Waiting for all StatefulSets to be ready in namespace: %s", namespace)
-		if err := s.waitForStatefulSetsReady(ctx, namespace); err != nil {
+		// Extract names of StatefulSets that were restarted
+		statefulsetNames := make([]string, len(toRestart))
+		for i, sts := range toRestart {
+			statefulsetNames[i] = sts.Name
+		}
+		if err := s.waitForStatefulSetsReady(ctx, namespace, statefulsetNames); err != nil {
 			return fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err)
 		}
 		s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
@@ -189,25 +194,23 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 }
 
 // waitForStatefulSetsReady waits for all specified statefulsets to be ready after restart
-func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, namespace string) error {
-	// List all statefulsets in the namespace
-	statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list statefulsets: %w", err)
-	}
-
-	if len(statefulsets.Items) == 0 {
+func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, namespace string, statefulsetNames []string) error {
+	if len(statefulsetNames) == 0 {
 		return nil
 	}
 
 	// Create a map of statefulset names for quick lookup with their initial generation
 	statefulsetGenerations := make(map[string]int64)
-	for _, statefulset := range statefulsets.Items {
-		statefulsetGenerations[statefulset.Name] = statefulset.Generation
+	for _, name := range statefulsetNames {
+		sts, err := s.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get StatefulSet %s: %w", name, err)
+		}
+		statefulsetGenerations[name] = sts.Generation
 	}
 
 	// Wait for statefulsets to be ready
-	s.log.Info("Waiting for %d statefulset(s) in namespace %s to become ready", len(statefulsets.Items), namespace)
+	s.log.Info("Waiting for %d statefulset(s) in namespace %s to become ready", len(statefulsetNames), namespace)
 
 	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(s.timeout)*time.Second)
