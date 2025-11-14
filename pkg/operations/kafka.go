@@ -21,10 +21,11 @@ type KafkaOperations struct {
 	dryRun    bool
 	log       *logger.Logger
 	minAge    *time.Duration
+	skipWait  bool
 }
 
 // NewKafkaOperations creates a new KafkaOperations instance
-func NewKafkaOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration) *KafkaOperations {
+func NewKafkaOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, skipWait bool) *KafkaOperations {
 	return &KafkaOperations{
 		clientset: clientset,
 		parallel:  parallel,
@@ -32,6 +33,7 @@ func NewKafkaOperations(clientset K8sClient, parallel, timeout int, dryRun bool,
 		dryRun:    dryRun,
 		log:       logger.NewLogger(dryRun),
 		minAge:    minAge,
+		skipWait:  skipWait,
 	}
 }
 
@@ -261,9 +263,13 @@ func (k *KafkaOperations) restartKafkaClustersInNamespace(ctx context.Context, n
 	k.log.Success("Successfully initiated restart of Kafka clusters in namespace %s", namespace)
 
 	// Wait for Kafka pods to be fully ready (not just running)
-	k.log.Info("Waiting for Kafka pods to complete restart in namespace %s", namespace)
-	if err := k.waitForKafkaRestart(ctx, namespace); err != nil {
-		return false, fmt.Errorf("failed to wait for Kafka pods to restart: %w", err)
+	if !k.skipWait {
+		k.log.Info("Waiting for Kafka pods to complete restart in namespace %s", namespace)
+		if err := k.waitForKafkaRestart(ctx, namespace); err != nil {
+			return false, fmt.Errorf("failed to wait for Kafka pods to restart: %w", err)
+		}
+	} else {
+		k.log.Info("Skipping wait for Kafka pods readiness (--skip-wait flag is set)")
 	}
 
 	return true, nil

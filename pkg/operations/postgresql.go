@@ -26,10 +26,11 @@ type PostgresqlOperations struct {
 	dryRun    bool
 	log       *logger.Logger
 	minAge    *time.Duration
+	skipWait  bool
 }
 
 // NewPostgresqlOperations creates a new PostgresqlOperations instance
-func NewPostgresqlOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration) *PostgresqlOperations {
+func NewPostgresqlOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, skipWait bool) *PostgresqlOperations {
 	return &PostgresqlOperations{
 		clientset: clientset,
 		parallel:  parallel,
@@ -37,6 +38,7 @@ func NewPostgresqlOperations(clientset K8sClient, parallel, timeout int, dryRun 
 		dryRun:    dryRun,
 		log:       logger.NewLogger(dryRun),
 		minAge:    minAge,
+		skipWait:  skipWait,
 	}
 }
 
@@ -254,9 +256,13 @@ func (p *PostgresqlOperations) restartPostgresqlClustersInNamespace(ctx context.
 	}
 
 	// Wait for PostgreSQL pods to be fully ready
-	p.log.Info("Waiting for PostgreSQL pods to complete restart in namespace %s", namespace)
-	if err := p.waitForPostgresqlRestart(ctx, namespace); err != nil {
-		return false, fmt.Errorf("failed to wait for PostgreSQL pods to restart: %w", err)
+	if !p.skipWait {
+		p.log.Info("Waiting for PostgreSQL pods to complete restart in namespace %s", namespace)
+		if err := p.waitForPostgresqlRestart(ctx, namespace); err != nil {
+			return false, fmt.Errorf("failed to wait for PostgreSQL pods to restart: %w", err)
+		}
+	} else {
+		p.log.Info("Skipping wait for PostgreSQL pods readiness (--skip-wait flag is set)")
 	}
 
 	return true, nil

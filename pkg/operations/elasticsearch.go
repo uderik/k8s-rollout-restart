@@ -21,10 +21,11 @@ type ElasticsearchOperations struct {
 	dryRun    bool
 	log       *logger.Logger
 	minAge    *time.Duration
+	skipWait  bool
 }
 
 // NewElasticsearchOperations creates a new ElasticsearchOperations instance
-func NewElasticsearchOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration) *ElasticsearchOperations {
+func NewElasticsearchOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, skipWait bool) *ElasticsearchOperations {
 	return &ElasticsearchOperations{
 		clientset: clientset,
 		parallel:  parallel,
@@ -32,6 +33,7 @@ func NewElasticsearchOperations(clientset K8sClient, parallel, timeout int, dryR
 		dryRun:    dryRun,
 		log:       logger.NewLogger(dryRun),
 		minAge:    minAge,
+		skipWait:  skipWait,
 	}
 }
 
@@ -227,9 +229,13 @@ func (e *ElasticsearchOperations) restartElasticsearchClustersInNamespace(ctx co
 	}
 
 	// Wait for Elasticsearch pods to be fully ready
-	e.log.Info("Waiting for Elasticsearch pods to complete restart in namespace %s", namespace)
-	if err := e.waitForElasticsearchRestart(ctx, namespace); err != nil {
-		return false, fmt.Errorf("failed to wait for Elasticsearch pods to restart: %w", err)
+	if !e.skipWait {
+		e.log.Info("Waiting for Elasticsearch pods to complete restart in namespace %s", namespace)
+		if err := e.waitForElasticsearchRestart(ctx, namespace); err != nil {
+			return false, fmt.Errorf("failed to wait for Elasticsearch pods to restart: %w", err)
+		}
+	} else {
+		e.log.Info("Skipping wait for Elasticsearch pods readiness (--skip-wait flag is set)")
 	}
 
 	return true, nil

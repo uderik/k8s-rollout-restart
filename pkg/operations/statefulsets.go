@@ -24,10 +24,11 @@ type StatefulSetOperations struct {
 	minAge         *time.Duration
 	podLabels      []string
 	podAnnotations []string
+	skipWait       bool
 }
 
 // NewStatefulSetOperations creates a new StatefulSetOperations instance
-func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string) *StatefulSetOperations {
+func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *StatefulSetOperations {
 	return &StatefulSetOperations{
 		clientset:      clientset,
 		parallel:       parallel,
@@ -38,6 +39,7 @@ func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, noFlag
 		minAge:         minAge,
 		podLabels:      podLabels,
 		podAnnotations: podAnnotations,
+		skipWait:       skipWait,
 	}
 }
 
@@ -178,16 +180,20 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 
 	// Wait for all StatefulSets to be ready if there are any
 	if len(toRestart) > 0 {
-		s.log.Info("Waiting for all StatefulSets to be ready in namespace: %s", namespace)
-		// Extract names of StatefulSets that were restarted
-		statefulsetNames := make([]string, len(toRestart))
-		for i, sts := range toRestart {
-			statefulsetNames[i] = sts.Name
+		if !s.skipWait {
+			s.log.Info("Waiting for all StatefulSets to be ready in namespace: %s", namespace)
+			// Extract names of StatefulSets that were restarted
+			statefulsetNames := make([]string, len(toRestart))
+			for i, sts := range toRestart {
+				statefulsetNames[i] = sts.Name
+			}
+			if err := s.waitForStatefulSetsReady(ctx, namespace, statefulsetNames); err != nil {
+				return fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err)
+			}
+			s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
+		} else {
+			s.log.Info("Skipping wait for StatefulSets readiness (--skip-wait flag is set)")
 		}
-		if err := s.waitForStatefulSetsReady(ctx, namespace, statefulsetNames); err != nil {
-			return fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err)
-		}
-		s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
 	}
 
 	return nil

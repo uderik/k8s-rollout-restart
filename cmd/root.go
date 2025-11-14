@@ -42,6 +42,7 @@ var (
 	clearCache     bool
 	podLabels      []string
 	podAnnotations []string
+	skipWait       bool
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -104,6 +105,7 @@ func init() {
 	rootCmd.Flags().StringSliceVar(&podLabels, "pod-labels", []string{}, "Only restart resources that have pods with these labels (format: key=value). Multiple labels can be specified comma-separated.")
 	rootCmd.Flags().StringSliceVar(&podAnnotations, "pod-annotations", []string{}, "Only restart resources that have pods with these annotations (format: key=value). Multiple annotations can be specified comma-separated.")
 	rootCmd.Flags().BoolVar(&clearCache, "clear-cache", false, "Clear Kubernetes client cache before execution")
+	rootCmd.Flags().BoolVar(&skipWait, "skip-wait", false, "Skip waiting for pods to become ready after restart")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
@@ -226,11 +228,11 @@ func runRoot(_ *cobra.Command, _ []string) error {
 
 	// Create operations
 	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, noFlagger, dryRun)
-	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations)
-	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations)
-	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge)
-	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge)
-	elasticsearchOps := operations.NewElasticsearchOperations(k8sClient, parallel, timeout, dryRun, minAge)
+	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations, skipWait)
+	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations, skipWait)
+	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
+	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
+	elasticsearchOps := operations.NewElasticsearchOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
 
 	// Initialize reporter
 	log.Info("Initializing reporter")

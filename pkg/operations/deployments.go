@@ -27,10 +27,11 @@ type DeploymentOperations struct {
 	podAnnotations       []string
 	parsedPodLabels      map[string]string // cached parsed pod labels
 	parsedPodAnnotations map[string]string // cached parsed pod annotations
+	skipWait             bool
 }
 
 // NewDeploymentOperations creates a new DeploymentOperations instance
-func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string) *DeploymentOperations {
+func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *DeploymentOperations {
 	// Parse pod labels once during initialization
 	parsedLabels := make(map[string]string)
 	for _, label := range podLabels {
@@ -61,6 +62,7 @@ func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagg
 		podAnnotations:       podAnnotations,
 		parsedPodLabels:      parsedLabels,
 		parsedPodAnnotations: parsedAnnotations,
+		skipWait:             skipWait,
 	}
 }
 
@@ -273,9 +275,13 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 	}
 
 	// Wait for all restarted deployments to be ready
-	d.log.Info("Waiting for deployments to become ready in namespace %s", namespace)
-	if err := d.waitForDeploymentsReady(ctx, namespace, deploymentsToRestart); err != nil {
-		return fmt.Errorf("failed waiting for deployments to become ready: %w", err)
+	if !d.skipWait {
+		d.log.Info("Waiting for deployments to become ready in namespace %s", namespace)
+		if err := d.waitForDeploymentsReady(ctx, namespace, deploymentsToRestart); err != nil {
+			return fmt.Errorf("failed waiting for deployments to become ready: %w", err)
+		}
+	} else {
+		d.log.Info("Skipping wait for deployments readiness (--skip-wait flag is set)")
 	}
 
 	d.log.Success("Successfully restarted %d deployment(s) in namespace %s",
