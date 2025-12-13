@@ -390,4 +390,3 @@ func (e *ElasticsearchOperations) waitForElasticsearchRestart(ctx context.Contex
 		}
 	}
 }
-

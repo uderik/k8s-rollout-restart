@@ -69,7 +69,7 @@ var rootCmd = &cobra.Command{
 This utility requires a Kubernetes context to be specified using the --context flag.`,
 	RunE: runRoot,
 	// Allow --version to work without required flags
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
 		// Skip validation if version flag is set
 		if showVersion {
 			return nil

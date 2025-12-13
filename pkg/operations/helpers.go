@@ -26,4 +26,3 @@ func MatchesRequirements(actual, required map[string]string) bool {
 	}
 	return true
 }
-

@@ -553,28 +553,9 @@ func (d *DeploymentOperations) podHasRequiredLabels(podLabels map[string]string)
 	requiredLabels := d.parsedPodLabels
 	if len(requiredLabels) == 0 && len(d.podLabels) > 0 {
 		// Fallback: parse labels on the fly for backward compatibility
-		requiredLabels = make(map[string]string)
-		for _, label := range d.podLabels {
-			parts := strings.Split(label, "=")
-			if len(parts) == 2 {
-				requiredLabels[parts[0]] = parts[1]
-			}
-		}
+		requiredLabels = ParseLabelsOrAnnotations(d.podLabels)
 	}
-
-	// If no labels required, return true
-	if len(requiredLabels) == 0 {
-		return true
-	}
-
-	// Check if pod has all required labels
-	for key, value := range requiredLabels {
-		if podLabels[key] != value {
-			return false
-		}
-	}
-
-	return true
+	return MatchesRequirements(podLabels, requiredLabels)
 }
 
 // podHasRequiredAnnotations checks if a pod has all the required annotations
@@ -583,28 +564,9 @@ func (d *DeploymentOperations) podHasRequiredAnnotations(podAnnotations map[stri
 	requiredAnnotations := d.parsedPodAnnotations
 	if len(requiredAnnotations) == 0 && len(d.podAnnotations) > 0 {
 		// Fallback: parse annotations on the fly for backward compatibility
-		requiredAnnotations = make(map[string]string)
-		for _, annotation := range d.podAnnotations {
-			parts := strings.Split(annotation, "=")
-			if len(parts) == 2 {
-				requiredAnnotations[parts[0]] = parts[1]
-			}
-		}
+		requiredAnnotations = ParseLabelsOrAnnotations(d.podAnnotations)
 	}
-
-	// If no annotations required, return true
-	if len(requiredAnnotations) == 0 {
-		return true
-	}
-
-	// Check if pod has all required annotations
-	for key, value := range requiredAnnotations {
-		if podAnnotations[key] != value {
-			return false
-		}
-	}
-
-	return true
+	return MatchesRequirements(podAnnotations, requiredAnnotations)
 }
 
 // GetDeploymentsToRestart returns a list of deployments that would be restarted
