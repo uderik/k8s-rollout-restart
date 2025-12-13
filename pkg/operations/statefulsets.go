@@ -19,7 +19,6 @@ type StatefulSetOperations struct {
 	parallel       int
 	timeout        int
 	dryRun         bool
-	noFlagger      bool
 	log            *logger.Logger
 	minAge         *time.Duration
 	podLabels      []string
@@ -28,13 +27,12 @@ type StatefulSetOperations struct {
 }
 
 // NewStatefulSetOperations creates a new StatefulSetOperations instance
-func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *StatefulSetOperations {
+func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, _, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *StatefulSetOperations {
 	return &StatefulSetOperations{
 		clientset:      clientset,
 		parallel:       parallel,
 		timeout:        timeout,
 		dryRun:         dryRun,
-		noFlagger:      noFlagger,
 		log:            logger.NewLogger(dryRun),
 		minAge:         minAge,
 		podLabels:      podLabels,
@@ -399,51 +397,14 @@ func (s *StatefulSetOperations) hasPodsWithLabelsOrAnnotations(ctx context.Conte
 
 // podHasRequiredLabels checks if a pod has all the required labels
 func (s *StatefulSetOperations) podHasRequiredLabels(podLabels map[string]string) bool {
-	// Parse required labels
-	requiredLabels := make(map[string]string)
-	for _, label := range s.podLabels {
-		parts := strings.Split(label, "=")
-		if len(parts) != 2 {
-			continue
-		}
-		requiredLabels[parts[0]] = parts[1]
-	}
-
-	// Check if pod has all required labels
-	for key, value := range requiredLabels {
-		if podLabels[key] != value {
-			return false
-		}
-	}
-
-	return true
+	requiredLabels := ParseLabelsOrAnnotations(s.podLabels)
+	return MatchesRequirements(podLabels, requiredLabels)
 }
 
 // podHasRequiredAnnotations checks if a pod has all the required annotations
 func (s *StatefulSetOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
-	// If no annotations required, return true
-	if len(s.podAnnotations) == 0 {
-		return true
-	}
-
-	// Parse required annotations
-	requiredAnnotations := make(map[string]string)
-	for _, annotation := range s.podAnnotations {
-		parts := strings.Split(annotation, "=")
-		if len(parts) != 2 {
-			continue
-		}
-		requiredAnnotations[parts[0]] = parts[1]
-	}
-
-	// Check if pod has all required annotations
-	for key, value := range requiredAnnotations {
-		if podAnnotations[key] != value {
-			return false
-		}
-	}
-
-	return true
+	requiredAnnotations := ParseLabelsOrAnnotations(s.podAnnotations)
+	return MatchesRequirements(podAnnotations, requiredAnnotations)
 }
 
 // GetStatefulSetsToRestart returns a list of statefulsets that would be restarted

@@ -1,3 +1,5 @@
+
+
 # k8s-rollout-restart
 
 Kubernetes cluster maintenance automation utility
@@ -31,7 +33,7 @@ A Go console utility for automating Kubernetes cluster maintenance process, incl
 
 ```bash
 # Install k8s-rollout-restart
-go install github.com/k8s-rollout-restart@latest
+go install github.com/uderik/k8s-rollout-restart@latest
 ```
 
 ## RBAC Requirements
@@ -210,8 +212,8 @@ go test -tags=integration ./...
 | `--older-than` | Restart only resources older than specified duration (e.g. 24h, 30m, 7d) |
 | `--pod-labels` | Only restart resources that have pods with these labels (format: key=value). Multiple labels can be specified comma-separated |
 | `--pod-annotations` | Only restart resources that have pods with these annotations (format: key=value). Multiple annotations can be specified comma-separated |
-| `--kube-api-qps` | The maximum queries-per-second of requests sent to the Kubernetes API (default 50) |
-| `--kube-api-burst` | The maximum burst queries-per-second of requests sent to the Kubernetes API (default 300) |
+| `--kube-api-qps` | The maximum queries-per-second of requests sent to the Kubernetes API (default 20) |
+| `--kube-api-burst` | The maximum burst queries-per-second of requests sent to the Kubernetes API (default 40) |
 
 ### Examples
 

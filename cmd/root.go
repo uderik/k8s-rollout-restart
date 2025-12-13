@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,6 +19,13 @@ import (
 	"github.com/uderik/k8s-rollout-restart/pkg/operations"
 	"github.com/uderik/k8s-rollout-restart/pkg/reporter"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// Version information (set via ldflags)
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 var (
@@ -43,6 +52,7 @@ var (
 	podLabels      []string
 	podAnnotations []string
 	skipWait       bool
+	showVersion    bool
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -58,20 +68,28 @@ var rootCmd = &cobra.Command{
 
 This utility requires a Kubernetes context to be specified using the --context flag.`,
 	RunE: runRoot,
+	// Allow --version to work without required flags
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Skip validation if version flag is set
+		if showVersion {
+			return nil
+		}
+		return nil
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() error {
-	// Отключаем автоматический вывод help от Cobra
+	// Disable automatic help output from Cobra
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
 
 	err := rootCmd.Execute()
 	if err != nil {
-		// Проверяем, является ли ошибка связанной с флагами
+		// Check if the error is related to flags
 		if strings.Contains(err.Error(), "flag") || strings.Contains(err.Error(), "Usage:") {
-			// Для ошибок, связанных с флагами, выводим help
+			// For flag-related errors, show help
 			fmt.Fprintf(os.Stderr, "\n")
 			_ = rootCmd.Help()
 		}
@@ -85,8 +103,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.k8s-rollout-restart.yaml)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Preview operations without execution")
 	rootCmd.Flags().BoolVarP(&execute, "execute", "e", false, "Execute operations")
-	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context (required)")
-	_ = rootCmd.MarkFlagRequired("context")
+	rootCmd.Flags().StringVarP(&ctxName, "context", "c", "", "Kubernetes context (required unless --version is used)")
 	rootCmd.Flags().StringSliceVarP(&namespaces, "namespace", "n", []string{}, "Kubernetes namespace(s). Multiple namespaces can be specified comma-separated.")
 	rootCmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Process resources across all namespaces")
 	rootCmd.Flags().StringSliceVar(&ignoreNS, "ignore-namespaces", []string{"karpenter"}, "Namespaces to ignore. Multiple namespaces can be specified comma-separated.")
@@ -106,6 +123,7 @@ func init() {
 	rootCmd.Flags().StringSliceVar(&podAnnotations, "pod-annotations", []string{}, "Only restart resources that have pods with these annotations (format: key=value). Multiple annotations can be specified comma-separated.")
 	rootCmd.Flags().BoolVar(&clearCache, "clear-cache", false, "Clear Kubernetes client cache before execution")
 	rootCmd.Flags().BoolVar(&skipWait, "skip-wait", false, "Skip waiting for pods to become ready after restart")
+	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Show version information")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
@@ -128,6 +146,12 @@ func initConfig() {
 }
 
 func runRoot(_ *cobra.Command, _ []string) error {
+	// Handle version flag
+	if showVersion {
+		fmt.Printf("k8s-rollout-restart %s (commit: %s, built: %s)\n", version, commit, date)
+		return nil
+	}
+
 	// Create logger first, to enable logging as early as possible
 	log := logger.NewLogger(dryRun)
 
@@ -202,9 +226,18 @@ func runRoot(_ *cobra.Command, _ []string) error {
 			return fmt.Errorf("failed to list namespaces: %w", err)
 		}
 
+		// Build a set of namespaces to ignore
+		ignoreSet := make(map[string]bool)
+		for _, ns := range ignoreNS {
+			ignoreSet[ns] = true
+		}
+		// Always ignore kube-system and kube-public
+		ignoreSet["kube-system"] = true
+		ignoreSet["kube-public"] = true
+
 		for _, ns := range namespacesList.Items {
-			// Skip kube-system and kube-public namespaces
-			if ns.Name == "kube-system" || ns.Name == "kube-public" {
+			// Skip ignored namespaces
+			if ignoreSet[ns.Name] {
 				continue
 			}
 			namespaces = append(namespaces, ns.Name)
@@ -331,52 +364,70 @@ func runRoot(_ *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	// Setup graceful shutdown handler for uncordoning nodes
+	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
+	defer cancel()
+
+	if doCordon {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-sigCh
+			log.Warning("Received signal %v, uncordoning nodes before exit...", sig)
+			if err := clusterOps.UncordonNodes(stdcontext.Background(), namespaces); err != nil {
+				log.Error("Failed to uncordon nodes during shutdown: %v", err)
+			}
+			cancel()
+			os.Exit(1)
+		}()
+	}
+
 	// Execute operations
 	if doCordon {
 		log.Info("Cordoning nodes")
-		if err := clusterOps.CordonNodes(stdcontext.Background(), namespaces, cordonAllNodes, nodeLabels, excludeLabels); err != nil {
+		if err := clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes, nodeLabels, excludeLabels); err != nil {
 			return fmt.Errorf("failed to cordon nodes: %w", err)
 		}
 	}
 
 	if restartDeployments {
 		log.Info("Restarting deployments")
-		if err := deploymentOps.RestartDeployments(stdcontext.Background(), namespaces); err != nil {
+		if err := deploymentOps.RestartDeployments(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart deployments: %w", err)
 		}
 	}
 
 	if restartStatefulSets {
 		log.Info("Restarting statefulsets")
-		if err := statefulSetOps.RestartStatefulSets(stdcontext.Background(), namespaces); err != nil {
+		if err := statefulSetOps.RestartStatefulSets(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart statefulsets: %w", err)
 		}
 	}
 
 	if restartKafka {
 		log.Info("Restarting Kafka clusters")
-		if err := kafkaOps.RestartKafkaClusters(stdcontext.Background(), namespaces); err != nil {
+		if err := kafkaOps.RestartKafkaClusters(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart Kafka clusters: %w", err)
 		}
 	}
 
 	if restartPostgresql {
 		log.Info("Restarting PostgreSQL clusters")
-		if err := postgresqlOps.RestartPostgresqlClusters(stdcontext.Background(), namespaces); err != nil {
+		if err := postgresqlOps.RestartPostgresqlClusters(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart PostgreSQL clusters: %w", err)
 		}
 	}
 
 	if restartElasticsearch {
 		log.Info("Restarting Elasticsearch clusters")
-		if err := elasticsearchOps.RestartElasticsearchClusters(stdcontext.Background(), namespaces); err != nil {
+		if err := elasticsearchOps.RestartElasticsearchClusters(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart Elasticsearch clusters: %w", err)
 		}
 	}
 
 	// Generate final report
 	log.Info("Generating final report")
-	finalReport, err := reporter.GenerateReport(stdcontext.Background(), namespaces)
+	finalReport, err := reporter.GenerateReport(ctx, namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate final report: %w", err)
 	}
@@ -415,10 +466,13 @@ func runRoot(_ *cobra.Command, _ []string) error {
 	// Uncordon nodes if they were cordoned
 	if doCordon {
 		log.Info("Uncordoning nodes")
-		if err := clusterOps.UncordonNodes(stdcontext.Background(), namespaces); err != nil {
+		if err := clusterOps.UncordonNodes(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to uncordon nodes: %w", err)
 		}
 	}
+
+	// Stop signal handler since we're done
+	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 
 	log.Success("Cluster maintenance completed successfully")
 	return nil

@@ -3,7 +3,6 @@ package operations
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
@@ -13,24 +12,23 @@ import (
 
 // ClusterOperations handles cluster-related operations
 type ClusterOperations struct {
-	clientset K8sClient
-	parallel  int
-	timeout   int
-	nodes     map[string]bool // map of node names that were cordoned
-	dryRun    bool
-	noFlagger bool
-	log       *logger.Logger
+	clientset  K8sClient
+	parallel   int
+	timeout    int
+	nodes      map[string]bool // map of node names that were cordoned
+	nodesMutex sync.RWMutex    // protects nodes map
+	dryRun     bool
+	log        *logger.Logger
 }
 
 // NewClusterOperations creates a new ClusterOperations instance
-func NewClusterOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool) *ClusterOperations {
+func NewClusterOperations(clientset K8sClient, parallel, timeout int, _, dryRun bool) *ClusterOperations {
 	return &ClusterOperations{
 		clientset: clientset,
 		parallel:  parallel,
 		timeout:   timeout,
 		nodes:     make(map[string]bool),
 		dryRun:    dryRun,
-		noFlagger: noFlagger,
 		log:       logger.NewLogger(dryRun),
 	}
 }
@@ -78,25 +76,11 @@ func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string
 		return nil
 	}
 
-	// Parse node labels
-	requiredLabels := make(map[string]string)
-	for _, label := range nodeLabels {
-		parts := strings.Split(label, "=")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid node label format: %s (expected key=value)", label)
-		}
-		requiredLabels[parts[0]] = parts[1]
-	}
+	// Parse node labels using helper
+	requiredLabels := ParseLabelsOrAnnotations(nodeLabels)
 
-	// Parse exclude labels
-	excludedLabels := make(map[string]string)
-	for _, label := range excludeLabels {
-		parts := strings.Split(label, "=")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid exclude label format: %s (expected key=value)", label)
-		}
-		excludedLabels[parts[0]] = parts[1]
-	}
+	// Parse exclude labels using helper
+	excludedLabels := ParseLabelsOrAnnotations(excludeLabels)
 
 	// Filter nodes by labels
 	filteredNodes := make(map[string]bool)
@@ -188,16 +172,22 @@ func (c *ClusterOperations) CordonNodes(ctx context.Context, namespaces []string
 
 // UncordonNodes uncordons all nodes previously cordoned
 func (c *ClusterOperations) UncordonNodes(ctx context.Context, namespaces []string) error {
+	c.nodesMutex.RLock()
+	nodesLen := len(c.nodes)
+	c.nodesMutex.RUnlock()
+
 	if c.dryRun {
 		c.log.Info("Would uncordon the following nodes:")
+		c.nodesMutex.RLock()
 		for node := range c.nodes {
 			c.log.Info("- %s", node)
 		}
+		c.nodesMutex.RUnlock()
 		return nil
 	}
 
 	// If nodes is empty, recreate list from namespaces
-	if len(c.nodes) == 0 {
+	if nodesLen == 0 {
 		// Get all nodes
 		nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		if err != nil {
@@ -215,22 +205,30 @@ func (c *ClusterOperations) UncordonNodes(ctx context.Context, namespaces []stri
 		}
 
 		// Add cordoned nodes to our tracking map
+		c.nodesMutex.Lock()
 		for _, node := range nodes.Items {
 			if node.Spec.Unschedulable && c.hasPodFromNamespaces(node.Name, allPods, namespaces) {
 				c.nodes[node.Name] = true
 			}
 		}
+		c.nodesMutex.Unlock()
 	}
 
-	if len(c.nodes) == 0 {
+	c.nodesMutex.RLock()
+	nodesLen = len(c.nodes)
+	c.nodesMutex.RUnlock()
+
+	if nodesLen == 0 {
 		c.log.Info("No cordoned nodes found, skipping uncordon")
 		return nil
 	}
 
 	// Uncordon each node
 	var wg sync.WaitGroup
+	c.nodesMutex.RLock()
 	ch := make(chan string, c.parallel)
 	errCh := make(chan error, len(c.nodes))
+	c.nodesMutex.RUnlock()
 
 	for i := 0; i < c.parallel; i++ {
 		wg.Add(1)
@@ -246,9 +244,11 @@ func (c *ClusterOperations) UncordonNodes(ctx context.Context, namespaces []stri
 	}
 
 	// Send nodes to uncordon
+	c.nodesMutex.RLock()
 	for nodeName := range c.nodes {
 		ch <- nodeName
 	}
+	c.nodesMutex.RUnlock()
 	close(ch)
 
 	wg.Wait()
@@ -293,7 +293,9 @@ func (c *ClusterOperations) cordonNode(ctx context.Context, nodeName string) err
 	}
 
 	// Mark node as cordoned in our tracking map
+	c.nodesMutex.Lock()
 	c.nodes[nodeName] = true
+	c.nodesMutex.Unlock()
 
 	c.log.Success("Node %s cordoned successfully", nodeName)
 	return nil
@@ -330,7 +332,9 @@ func (c *ClusterOperations) uncordonNode(ctx context.Context, nodeName string) e
 	}
 
 	// Remove node from our tracking map
+	c.nodesMutex.Lock()
 	delete(c.nodes, nodeName)
+	c.nodesMutex.Unlock()
 
 	c.log.Success("Node %s uncordoned successfully", nodeName)
 	return nil

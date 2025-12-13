@@ -32,24 +32,6 @@ type DeploymentOperations struct {
 
 // NewDeploymentOperations creates a new DeploymentOperations instance
 func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *DeploymentOperations {
-	// Parse pod labels once during initialization
-	parsedLabels := make(map[string]string)
-	for _, label := range podLabels {
-		parts := strings.Split(label, "=")
-		if len(parts) == 2 {
-			parsedLabels[parts[0]] = parts[1]
-		}
-	}
-
-	// Parse pod annotations once during initialization
-	parsedAnnotations := make(map[string]string)
-	for _, annotation := range podAnnotations {
-		parts := strings.Split(annotation, "=")
-		if len(parts) == 2 {
-			parsedAnnotations[parts[0]] = parts[1]
-		}
-	}
-
 	return &DeploymentOperations{
 		clientset:            clientset,
 		parallel:             parallel,
@@ -60,8 +42,8 @@ func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagg
 		minAge:               minAge,
 		podLabels:            podLabels,
 		podAnnotations:       podAnnotations,
-		parsedPodLabels:      parsedLabels,
-		parsedPodAnnotations: parsedAnnotations,
+		parsedPodLabels:      ParseLabelsOrAnnotations(podLabels),
+		parsedPodAnnotations: ParseLabelsOrAnnotations(podAnnotations),
 		skipWait:             skipWait,
 	}
 }
@@ -259,14 +241,14 @@ func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context
 	close(workerErrCh)
 
 	// Collect all errors
-	var errors []error
+	var errs []error
 	for err := range workerErrCh {
-		errors = append(errors, err)
+		errs = append(errs, err)
 	}
 
 	// Return combined error if any errors occurred
-	if len(errors) > 0 {
-		return fmt.Errorf("errors during deployment restart: %v", errors)
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during deployment restart: %v", errs)
 	}
 
 	if len(skippedDeployments) > 0 {
@@ -445,10 +427,14 @@ func isDeploymentReady(deployment *appsv1.Deployment) bool {
 func (d *DeploymentOperations) WaitForDeployments(ctx context.Context, namespaces []string) error {
 	d.log.Info("Waiting for deployments to be ready in namespaces: %v", namespaces)
 
+	// Create a timeout context
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(d.timeout)*time.Second)
+	defer cancel()
+
 	// Get all deployments first
 	allDeployments := make(map[string][]string)
 	for _, ns := range namespaces {
-		deployments, err := d.clientset.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+		deployments, err := d.clientset.AppsV1().Deployments(ns).List(timeoutCtx, metav1.ListOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
 		}
@@ -459,16 +445,32 @@ func (d *DeploymentOperations) WaitForDeployments(ctx context.Context, namespace
 	}
 
 	// Wait for all deployments to be ready
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	for _, ns := range namespaces {
-		deployments := allDeployments[ns]
-		if len(deployments) == 0 {
-			d.log.Info("No deployments found in namespace %s", ns)
-			continue
+		if err := d.waitForNamespaceDeployments(timeoutCtx, ns, allDeployments[ns], ticker); err != nil {
+			return err
 		}
+	}
 
-		d.log.Info("Waiting for deployments to be ready in namespace %s (%d deployments)", ns, len(deployments))
+	return nil
+}
 
-		for {
+// waitForNamespaceDeployments waits for all deployments in a single namespace to be ready
+func (d *DeploymentOperations) waitForNamespaceDeployments(ctx context.Context, ns string, deployments []string, ticker *time.Ticker) error {
+	if len(deployments) == 0 {
+		d.log.Info("No deployments found in namespace %s", ns)
+		return nil
+	}
+
+	d.log.Info("Waiting for deployments to be ready in namespace %s (%d deployments)", ns, len(deployments))
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for deployments to be ready in namespace %s", ns)
+		case <-ticker.C:
 			readyCount := 0
 			for _, deploymentName := range deployments {
 				deployment, err := d.clientset.AppsV1().Deployments(ns).Get(ctx, deploymentName, metav1.GetOptions{})
@@ -483,15 +485,12 @@ func (d *DeploymentOperations) WaitForDeployments(ctx context.Context, namespace
 
 			if readyCount == len(deployments) {
 				d.log.Info("All deployments are ready in namespace %s", ns)
-				break
+				return nil
 			}
 
 			d.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)", ns, readyCount, len(deployments))
-			time.Sleep(5 * time.Second)
 		}
 	}
-
-	return nil
 }
 
 // hasPodsWithLabelsOrAnnotations checks if a deployment has pods with the required labels or annotations

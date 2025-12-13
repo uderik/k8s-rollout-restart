@@ -77,9 +77,11 @@ func NewCacheManager(client kubernetes.Interface, config CacheConfig) *CacheMana
 
 // GetDeployment retrieves a Deployment from cache or Kubernetes API
 func (cm *CacheManager) GetDeployment(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
+	cacheKey := namespace + "/" + name
+
 	// Check cache
 	cm.cacheMutex.RLock()
-	if entry, exists := cm.deploymentsCache[name]; exists {
+	if entry, exists := cm.deploymentsCache[cacheKey]; exists {
 		if time.Since(entry.timestamp) < cm.cacheTTL {
 			cm.cacheMutex.RUnlock()
 			return entry.data.(*appsv1.Deployment), nil
@@ -100,7 +102,7 @@ func (cm *CacheManager) GetDeployment(ctx context.Context, namespace, name strin
 
 	// Update cache
 	cm.cacheMutex.Lock()
-	cm.deploymentsCache[name] = deploymentCacheEntry{
+	cm.deploymentsCache[cacheKey] = deploymentCacheEntry{
 		cacheEntry: cacheEntry{
 			data:      deployment,
 			timestamp: time.Now(),
@@ -114,9 +116,11 @@ func (cm *CacheManager) GetDeployment(ctx context.Context, namespace, name strin
 
 // GetStatefulSet retrieves a StatefulSet from cache or Kubernetes API
 func (cm *CacheManager) GetStatefulSet(ctx context.Context, namespace, name string) (*appsv1.StatefulSet, error) {
+	cacheKey := namespace + "/" + name
+
 	// Check cache
 	cm.cacheMutex.RLock()
-	if entry, exists := cm.statefulSetsCache[name]; exists {
+	if entry, exists := cm.statefulSetsCache[cacheKey]; exists {
 		if time.Since(entry.timestamp) < cm.cacheTTL {
 			cm.cacheMutex.RUnlock()
 			return entry.data.(*appsv1.StatefulSet), nil
@@ -137,7 +141,7 @@ func (cm *CacheManager) GetStatefulSet(ctx context.Context, namespace, name stri
 
 	// Update cache
 	cm.cacheMutex.Lock()
-	cm.statefulSetsCache[name] = statefulSetCacheEntry{
+	cm.statefulSetsCache[cacheKey] = statefulSetCacheEntry{
 		cacheEntry: cacheEntry{
 			data:      statefulSet,
 			timestamp: time.Now(),
@@ -233,17 +237,19 @@ func (cm *CacheManager) InvalidateCache() {
 }
 
 // InvalidateDeploymentCache clears cache for a specific Deployment
-func (cm *CacheManager) InvalidateDeploymentCache(name string) {
+func (cm *CacheManager) InvalidateDeploymentCache(namespace, name string) {
 	cm.cacheMutex.Lock()
 	defer cm.cacheMutex.Unlock()
-	delete(cm.deploymentsCache, name)
+	cacheKey := namespace + "/" + name
+	delete(cm.deploymentsCache, cacheKey)
 }
 
 // InvalidateStatefulSetCache clears cache for a specific StatefulSet
-func (cm *CacheManager) InvalidateStatefulSetCache(name string) {
+func (cm *CacheManager) InvalidateStatefulSetCache(namespace, name string) {
 	cm.cacheMutex.Lock()
 	defer cm.cacheMutex.Unlock()
-	delete(cm.statefulSetsCache, name)
+	cacheKey := namespace + "/" + name
+	delete(cm.statefulSetsCache, cacheKey)
 }
 
 // InvalidateNodeCache clears cache for a specific Node
