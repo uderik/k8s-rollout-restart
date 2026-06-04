@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -120,7 +122,8 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 
 		// Check if StatefulSet has pods with required labels or annotations
 		if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
-			hasMatchingPods, err := s.hasPodsWithLabelsOrAnnotations(ctx, namespace, statefulset.Name)
+			sts := statefulset
+			hasMatchingPods, err := s.hasPodsWithLabelsOrAnnotations(ctx, namespace, &sts)
 			if err != nil {
 				s.log.Warning("Failed to check pods for StatefulSet %s: %v", statefulset.Name, err)
 				continue
@@ -165,36 +168,39 @@ func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Conte
 		return nil
 	}
 
-	// Process each StatefulSet that passed the filters
+	// Process each StatefulSet that passed the filters. A failure to patch one
+	// StatefulSet must not prevent the remaining ones from being restarted, so
+	// we accumulate errors and continue, mirroring the Deployments path.
+	var restartErrs []error
+	restartedNames := make([]string, 0, len(toRestart))
 	for _, statefulset := range toRestart {
 		s.log.Info("Restarting StatefulSet: %s/%s", namespace, statefulset.Name)
 
 		if err := s.triggerStatefulSetRollout(ctx, namespace, statefulset.Name); err != nil {
-			return fmt.Errorf("failed to trigger rollout for StatefulSet %s/%s: %w", namespace, statefulset.Name, err)
+			s.log.Warning("Failed to trigger rollout for StatefulSet %s/%s: %v", namespace, statefulset.Name, err)
+			restartErrs = append(restartErrs, fmt.Errorf("failed to trigger rollout for StatefulSet %s/%s: %w", namespace, statefulset.Name, err))
+			continue
 		}
 
+		restartedNames = append(restartedNames, statefulset.Name)
 		s.log.Success("Successfully triggered rollout for StatefulSet: %s/%s", namespace, statefulset.Name)
 	}
 
-	// Wait for all StatefulSets to be ready if there are any
-	if len(toRestart) > 0 {
+	// Wait only for the StatefulSets that were actually restarted.
+	if len(restartedNames) > 0 {
 		if !s.skipWait {
 			s.log.Info("Waiting for all StatefulSets to be ready in namespace: %s", namespace)
-			// Extract names of StatefulSets that were restarted
-			statefulsetNames := make([]string, len(toRestart))
-			for i, sts := range toRestart {
-				statefulsetNames[i] = sts.Name
+			if err := s.waitForStatefulSetsReady(ctx, namespace, restartedNames); err != nil {
+				restartErrs = append(restartErrs, fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err))
+			} else {
+				s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
 			}
-			if err := s.waitForStatefulSetsReady(ctx, namespace, statefulsetNames); err != nil {
-				return fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err)
-			}
-			s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
 		} else {
 			s.log.Info("Skipping wait for StatefulSets readiness (--skip-wait flag is set)")
 		}
 	}
 
-	return nil
+	return errors.Join(restartErrs...)
 }
 
 // waitForStatefulSetsReady waits for all specified statefulsets to be ready after restart
@@ -251,9 +257,20 @@ func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, na
 					isReady = false
 				}
 
-				// Check replicas status
-				if statefulset.Status.ReadyReplicas != statefulset.Status.Replicas ||
-					statefulset.Status.UpdatedReplicas != statefulset.Status.Replicas {
+				// Determine the desired replica count. Status.Replicas is the
+				// observed number of pods (which transiently drops below the
+				// desired count mid-rollout as the controller recreates pods),
+				// so comparing against it can report readiness prematurely.
+				desired := int32(1)
+				if statefulset.Spec.Replicas != nil {
+					desired = *statefulset.Spec.Replicas
+				}
+
+				// All desired replicas must be updated and ready, and the
+				// rollout must have fully converged onto the new revision.
+				if statefulset.Status.UpdatedReplicas != desired ||
+					statefulset.Status.ReadyReplicas != desired ||
+					statefulset.Status.CurrentRevision != statefulset.Status.UpdateRevision {
 					isReady = false
 				}
 
@@ -348,41 +365,40 @@ func (s *StatefulSetOperations) triggerStatefulSetRollout(ctx context.Context, n
 }
 
 // hasPodsWithLabelsOrAnnotations checks if a StatefulSet has pods with the required labels or annotations
-func (s *StatefulSetOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace, statefulSetName string) (bool, error) {
-	// Get pods for this StatefulSet
-	pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", statefulSetName),
-	})
-	if err != nil {
-		return false, fmt.Errorf("failed to list pods for StatefulSet %s: %w", statefulSetName, err)
-	}
+func (s *StatefulSetOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace string, statefulset *appsv1.StatefulSet) (bool, error) {
+	var pods *corev1.PodList
 
-	// If no pods found, try alternative label selectors
-	if len(pods.Items) == 0 {
-		// Try with StatefulSet name as label
-		pods, err = s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("statefulset=%s", statefulSetName),
+	// Primary: select pods using the StatefulSet's own pod selector. Guessing
+	// conventional labels like "app=<name>" is unreliable and can match
+	// unrelated pods, so derive the selector from the spec.
+	if statefulset.Spec.Selector != nil {
+		selector := metav1.FormatLabelSelector(statefulset.Spec.Selector)
+		list, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: selector,
 		})
 		if err != nil {
-			return false, fmt.Errorf("failed to list pods for StatefulSet %s: %w", statefulSetName, err)
+			return false, fmt.Errorf("failed to list pods for StatefulSet %s: %w", statefulset.Name, err)
 		}
+		pods = list
 	}
 
-	// If still no pods, try to find pods by owner reference
-	if len(pods.Items) == 0 {
+	// Fallback: match by owner reference (covers StatefulSets without a usable
+	// label selector).
+	if pods == nil || len(pods.Items) == 0 {
 		allPods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return false, fmt.Errorf("failed to list all pods in namespace %s: %w", namespace, err)
 		}
 
-		// Find pods owned by this StatefulSet
+		owned := &corev1.PodList{}
 		for _, pod := range allPods.Items {
 			for _, owner := range pod.OwnerReferences {
-				if owner.Kind == "StatefulSet" && owner.Name == statefulSetName {
-					pods.Items = append(pods.Items, pod)
+				if owner.Kind == "StatefulSet" && owner.Name == statefulset.Name {
+					owned.Items = append(owned.Items, pod)
 				}
 			}
 		}
+		pods = owned
 	}
 
 	// Check if any pod has the required labels or annotations

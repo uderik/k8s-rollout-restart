@@ -185,17 +185,13 @@ type appsV1Adapter struct {
 
 func (a *appsV1Adapter) Deployments(namespace string) operations.DeploymentInterface {
 	return &deploymentAdapter{
-		deployments:  a.appsV1.Deployments(namespace),
-		cacheManager: a.cacheManager,
-		namespace:    namespace,
+		deployments: a.appsV1.Deployments(namespace),
 	}
 }
 
 func (a *appsV1Adapter) StatefulSets(namespace string) operations.StatefulSetInterface {
 	return &statefulSetAdapter{
 		statefulsets: a.appsV1.StatefulSets(namespace),
-		cacheManager: a.cacheManager,
-		namespace:    namespace,
 	}
 }
 
@@ -207,9 +203,7 @@ func (a *appsV1Adapter) ReplicaSets(namespace string) operations.ReplicaSetInter
 
 // deploymentAdapter adapts DeploymentInterface
 type deploymentAdapter struct {
-	deployments  typedappsv1.DeploymentInterface
-	cacheManager *CacheManager
-	namespace    string
+	deployments typedappsv1.DeploymentInterface
 }
 
 func (a *deploymentAdapter) List(ctx context.Context, opts metav1.ListOptions) (*appsv1.DeploymentList, error) {
@@ -217,12 +211,10 @@ func (a *deploymentAdapter) List(ctx context.Context, opts metav1.ListOptions) (
 }
 
 func (a *deploymentAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.Deployment, error) {
-	// If specific ResourceVersion requested, bypass cache
-	if opts.ResourceVersion != "" && opts.ResourceVersion != "0" {
-		return a.deployments.Get(ctx, name, opts)
-	}
-	// Use cache for normal requests
-	return a.cacheManager.GetDeployment(ctx, a.namespace, name)
+	// Always read live. Get is used by the readiness-polling loops to observe
+	// Status changing after a restart; serving those reads from the TTL cache
+	// would return stale, pre-restart status and break restart verification.
+	return a.deployments.Get(ctx, name, opts)
 }
 
 func (a *deploymentAdapter) Update(ctx context.Context, deployment *appsv1.Deployment, opts metav1.UpdateOptions) (*appsv1.Deployment, error) {
@@ -236,8 +228,6 @@ func (a *deploymentAdapter) Patch(ctx context.Context, name string, pt types.Pat
 // statefulSetAdapter adapts StatefulSetInterface
 type statefulSetAdapter struct {
 	statefulsets typedappsv1.StatefulSetInterface
-	cacheManager *CacheManager
-	namespace    string
 }
 
 func (a *statefulSetAdapter) List(ctx context.Context, opts metav1.ListOptions) (*appsv1.StatefulSetList, error) {
@@ -245,12 +235,10 @@ func (a *statefulSetAdapter) List(ctx context.Context, opts metav1.ListOptions) 
 }
 
 func (a *statefulSetAdapter) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error) {
-	// If specific ResourceVersion requested, bypass cache
-	if opts.ResourceVersion != "" && opts.ResourceVersion != "0" {
-		return a.statefulsets.Get(ctx, name, opts)
-	}
-	// Use cache for normal requests
-	return a.cacheManager.GetStatefulSet(ctx, a.namespace, name)
+	// Always read live. Get is used by the readiness-polling loops to observe
+	// Status changing after a restart; serving those reads from the TTL cache
+	// would return stale, pre-restart status and break restart verification.
+	return a.statefulsets.Get(ctx, name, opts)
 }
 
 func (a *statefulSetAdapter) Update(ctx context.Context, statefulset *appsv1.StatefulSet, opts metav1.UpdateOptions) (*appsv1.StatefulSet, error) {

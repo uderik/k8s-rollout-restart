@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -49,8 +50,13 @@ type LogEntry struct {
 	DryRun    bool     `json:"dry_run,omitempty"`
 }
 
-// Logger provides formatted logging functionality
+// Logger provides formatted logging functionality.
+// It is safe for concurrent use by multiple goroutines: a single Logger
+// instance is shared across the parallel restart workers, so all output is
+// serialized through mu to avoid interleaved/garbled lines (color escape
+// sequences emit several writes per message).
 type Logger struct {
+	mu     sync.Mutex
 	dryRun bool
 	format LogFormat
 }
@@ -65,12 +71,16 @@ func NewLogger(dryRun bool) *Logger {
 
 // SetFormat sets the log output format
 func (l *Logger) SetFormat(format LogFormat) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.format = format
 }
 
 // Info logs an informational message
 func (l *Logger) Info(format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.format == JSONFormat {
 		l.logJSON(InfoLevel, message)
 	} else {
@@ -85,6 +95,8 @@ func (l *Logger) Info(format string, args ...interface{}) {
 // Success logs a success message
 func (l *Logger) Success(format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.format == JSONFormat {
 		l.logJSON(SuccessLevel, message)
 	} else {
@@ -99,6 +111,8 @@ func (l *Logger) Success(format string, args ...interface{}) {
 // Warning logs a warning message
 func (l *Logger) Warning(format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.format == JSONFormat {
 		l.logJSON(WarningLevel, message)
 	} else {
@@ -113,6 +127,8 @@ func (l *Logger) Warning(format string, args ...interface{}) {
 // Error logs an error message
 func (l *Logger) Error(format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.format == JSONFormat {
 		l.logJSON(ErrorLevel, message)
 	} else {

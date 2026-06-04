@@ -53,6 +53,8 @@ var (
 	podAnnotations []string
 	skipWait       bool
 	showVersion    bool
+	kafkaAPIVer    string
+	podSetAPIVer   string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -124,6 +126,8 @@ func init() {
 	rootCmd.Flags().BoolVar(&clearCache, "clear-cache", false, "Clear Kubernetes client cache before execution")
 	rootCmd.Flags().BoolVar(&skipWait, "skip-wait", false, "Skip waiting for pods to become ready after restart")
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Show version information")
+	rootCmd.Flags().StringVar(&kafkaAPIVer, "strimzi-kafka-api", operations.DefaultKafkaAPIVersion, "Strimzi Kafka CR API group/version")
+	rootCmd.Flags().StringVar(&podSetAPIVer, "strimzi-podset-api", operations.DefaultStrimziPodSetAPIVersion, "Strimzi StrimziPodSet API group/version")
 
 	// Mark execute and dry-run as mutually exclusive
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "execute")
@@ -177,6 +181,22 @@ func runRoot(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("either --dry-run or --execute flag must be specified")
 	}
 
+	// Validate numeric flags before any expensive work. Non-positive values
+	// lead to deadlocks (parallel), instantly-expiring contexts (timeout) or a
+	// client rate limiter that rejects every request (qps/burst).
+	if parallel < 1 {
+		return fmt.Errorf("--parallel must be at least 1 (got %d)", parallel)
+	}
+	if timeout < 1 {
+		return fmt.Errorf("--timeout must be at least 1 second (got %d)", timeout)
+	}
+	if kubeAPIQPS <= 0 {
+		return fmt.Errorf("--kube-api-qps must be greater than 0 (got %g)", kubeAPIQPS)
+	}
+	if kubeAPIBurst < 1 {
+		return fmt.Errorf("--kube-api-burst must be at least 1 (got %d)", kubeAPIBurst)
+	}
+
 	// Validate resource types first, before any expensive operations
 	log.Info("Validating resource types")
 	var restartDeployments, restartStatefulSets, restartKafka, restartPostgresql, restartElasticsearch bool
@@ -221,7 +241,9 @@ func runRoot(_ *cobra.Command, _ []string) error {
 	// If all-namespaces flag is set, get all namespaces
 	if allNamespaces {
 		log.Info("Getting all namespaces")
-		namespacesList, err := k8sClient.CoreV1().Namespaces().List(stdcontext.Background(), metav1.ListOptions{})
+		listCtx, listCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
+		namespacesList, err := k8sClient.CoreV1().Namespaces().List(listCtx, metav1.ListOptions{})
+		listCancel()
 		if err != nil {
 			return fmt.Errorf("failed to list namespaces: %w", err)
 		}
@@ -263,7 +285,7 @@ func runRoot(_ *cobra.Command, _ []string) error {
 	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, noFlagger, dryRun)
 	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations, skipWait)
 	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations, skipWait)
-	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
+	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait, kafkaAPIVer, podSetAPIVer)
 	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
 	elasticsearchOps := operations.NewElasticsearchOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
 
@@ -273,7 +295,9 @@ func runRoot(_ *cobra.Command, _ []string) error {
 
 	// Generate initial report
 	log.Info("Generating initial report")
-	initialReport, err := reporter.GenerateReport(stdcontext.Background(), namespaces)
+	initialReportCtx, initialReportCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
+	initialReport, err := reporter.GenerateReport(initialReportCtx, namespaces)
+	initialReportCancel()
 	if err != nil {
 		return fmt.Errorf("failed to generate initial report: %w", err)
 	}
@@ -364,76 +388,163 @@ func runRoot(_ *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	// Setup graceful shutdown handler for uncordoning nodes
+	// Root context for all maintenance operations. Cancelling it asks in-flight
+	// work to stop (e.g. on Ctrl-C) so we can uncordon cleanly afterwards.
 	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
 	defer cancel()
+
+	// uncordon runs UncordonNodes with a bounded context derived from the root,
+	// so a stuck API server can never make shutdown hang forever.
+	uncordon := func(reason string) error {
+		log.Info("Uncordoning nodes%s", reason)
+		uncordonCtx, uncCancel := stdcontext.WithTimeout(stdcontext.Background(), time.Duration(timeout)*time.Second)
+		defer uncCancel()
+		return clusterOps.UncordonNodes(uncordonCtx, namespaces)
+	}
+
+	// Run the maintenance sequence (cordon, restarts, final report) in a
+	// goroutine so the main goroutine can react to termination signals without
+	// racing the in-flight node mutations.
+	opsErr := make(chan error, 1)
+	go func() {
+		opsErr <- runMaintenance(ctx, log, namespaces, restartFlags{
+			deployments:   restartDeployments,
+			statefulSets:  restartStatefulSets,
+			kafka:         restartKafka,
+			postgresql:    restartPostgresql,
+			elasticsearch: restartElasticsearch,
+			cordon:        doCordon,
+			cordonAll:     cordonAllNodes,
+			outputJSON:    output == "json",
+		}, maintenanceOps{
+			cluster:       clusterOps,
+			deployment:    deploymentOps,
+			statefulSet:   statefulSetOps,
+			kafka:         kafkaOps,
+			postgresql:    postgresqlOps,
+			elasticsearch: elasticsearchOps,
+			reporter:      reporter,
+		}, nodeLabels, excludeLabels)
+	}()
 
 	if doCordon {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			sig := <-sigCh
-			log.Warning("Received signal %v, uncordoning nodes before exit...", sig)
-			if err := clusterOps.UncordonNodes(stdcontext.Background(), namespaces); err != nil {
+		defer signal.Stop(sigCh)
+
+		select {
+		case sig := <-sigCh:
+			log.Warning("Received signal %v, stopping work and uncordoning nodes before exit...", sig)
+			cancel() // ask in-flight operations to stop
+			<-opsErr // wait for them to actually return before mutating nodes
+			if err := uncordon(" after interruption"); err != nil {
 				log.Error("Failed to uncordon nodes during shutdown: %v", err)
+				return fmt.Errorf("interrupted by signal %v; failed to uncordon nodes: %w", sig, err)
 			}
-			cancel()
-			os.Exit(1)
-		}()
+			log.Success("Nodes uncordoned after interruption")
+			return fmt.Errorf("interrupted by signal %v", sig)
+		case err := <-opsErr:
+			if err != nil {
+				// Operations failed; still attempt to uncordon before returning.
+				if uncErr := uncordon(" after failure"); uncErr != nil {
+					log.Error("Failed to uncordon nodes after error: %v", uncErr)
+				}
+				return err
+			}
+			if err := uncordon(""); err != nil {
+				return fmt.Errorf("failed to uncordon nodes: %w", err)
+			}
+		}
+	} else if err := <-opsErr; err != nil {
+		return err
 	}
 
-	// Execute operations
-	if doCordon {
+	// Stop signal handler since we're done
+	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+
+	log.Success("Cluster maintenance completed successfully")
+	return nil
+}
+
+// restartFlags captures which resource types and behaviors are enabled.
+type restartFlags struct {
+	deployments   bool
+	statefulSets  bool
+	kafka         bool
+	postgresql    bool
+	elasticsearch bool
+	cordon        bool
+	cordonAll     bool
+	outputJSON    bool
+}
+
+// maintenanceOps bundles the operation handlers used by runMaintenance.
+type maintenanceOps struct {
+	cluster       *operations.ClusterOperations
+	deployment    *operations.DeploymentOperations
+	statefulSet   *operations.StatefulSetOperations
+	kafka         *operations.KafkaOperations
+	postgresql    *operations.PostgresqlOperations
+	elasticsearch *operations.ElasticsearchOperations
+	reporter      *reporter.Reporter
+}
+
+// runMaintenance executes the cordon + restart sequence and prints the final
+// report. It deliberately does NOT uncordon nodes: the caller owns uncordon so
+// it can run it on success, failure, and interruption with an appropriate
+// (bounded) context, and only after this function has returned.
+func runMaintenance(ctx stdcontext.Context, log *logger.Logger, namespaces []string, flags restartFlags, ops maintenanceOps, nodeLabels, excludeLabels []string) error {
+	if flags.cordon {
 		log.Info("Cordoning nodes")
-		if err := clusterOps.CordonNodes(ctx, namespaces, cordonAllNodes, nodeLabels, excludeLabels); err != nil {
+		if err := ops.cluster.CordonNodes(ctx, namespaces, flags.cordonAll, nodeLabels, excludeLabels); err != nil {
 			return fmt.Errorf("failed to cordon nodes: %w", err)
 		}
 	}
 
-	if restartDeployments {
+	if flags.deployments {
 		log.Info("Restarting deployments")
-		if err := deploymentOps.RestartDeployments(ctx, namespaces); err != nil {
+		if err := ops.deployment.RestartDeployments(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart deployments: %w", err)
 		}
 	}
 
-	if restartStatefulSets {
+	if flags.statefulSets {
 		log.Info("Restarting statefulsets")
-		if err := statefulSetOps.RestartStatefulSets(ctx, namespaces); err != nil {
+		if err := ops.statefulSet.RestartStatefulSets(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart statefulsets: %w", err)
 		}
 	}
 
-	if restartKafka {
+	if flags.kafka {
 		log.Info("Restarting Kafka clusters")
-		if err := kafkaOps.RestartKafkaClusters(ctx, namespaces); err != nil {
+		if err := ops.kafka.RestartKafkaClusters(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart Kafka clusters: %w", err)
 		}
 	}
 
-	if restartPostgresql {
+	if flags.postgresql {
 		log.Info("Restarting PostgreSQL clusters")
-		if err := postgresqlOps.RestartPostgresqlClusters(ctx, namespaces); err != nil {
+		if err := ops.postgresql.RestartPostgresqlClusters(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart PostgreSQL clusters: %w", err)
 		}
 	}
 
-	if restartElasticsearch {
+	if flags.elasticsearch {
 		log.Info("Restarting Elasticsearch clusters")
-		if err := elasticsearchOps.RestartElasticsearchClusters(ctx, namespaces); err != nil {
+		if err := ops.elasticsearch.RestartElasticsearchClusters(ctx, namespaces); err != nil {
 			return fmt.Errorf("failed to restart Elasticsearch clusters: %w", err)
 		}
 	}
 
 	// Generate final report
 	log.Info("Generating final report")
-	finalReport, err := reporter.GenerateReport(ctx, namespaces)
+	finalReport, err := ops.reporter.GenerateReport(ctx, namespaces)
 	if err != nil {
 		return fmt.Errorf("failed to generate final report: %w", err)
 	}
 
 	// Print final report
-	if output == "json" {
+	if flags.outputJSON {
 		jsonData, err := json.Marshal(finalReport)
 		if err != nil {
 			return fmt.Errorf("failed to marshal report to JSON: %w", err)
@@ -442,19 +553,19 @@ func runRoot(_ *cobra.Command, _ []string) error {
 	} else {
 		log.Info("Final cluster state:")
 		components := make([]string, 0)
-		if restartDeployments {
+		if flags.deployments {
 			components = append(components, fmt.Sprintf("Deployments: %d", finalReport.Components.Deployments))
 		}
-		if restartStatefulSets {
+		if flags.statefulSets {
 			components = append(components, fmt.Sprintf("StatefulSets: %d", finalReport.Components.StatefulSets))
 		}
-		if restartKafka {
+		if flags.kafka {
 			components = append(components, fmt.Sprintf("Kafka: %d", finalReport.Components.Kafka))
 		}
-		if restartPostgresql {
+		if flags.postgresql {
 			components = append(components, fmt.Sprintf("PostgreSQL: %d", finalReport.Components.Postgresql))
 		}
-		if restartElasticsearch {
+		if flags.elasticsearch {
 			components = append(components, fmt.Sprintf("Elasticsearch: %d", finalReport.Components.Elasticsearch))
 		}
 		log.Info("Nodes: %d, %s, Unschedulable: %d",
@@ -463,18 +574,6 @@ func runRoot(_ *cobra.Command, _ []string) error {
 			countUnschedulableNodes(finalReport))
 	}
 
-	// Uncordon nodes if they were cordoned
-	if doCordon {
-		log.Info("Uncordoning nodes")
-		if err := clusterOps.UncordonNodes(ctx, namespaces); err != nil {
-			return fmt.Errorf("failed to uncordon nodes: %w", err)
-		}
-	}
-
-	// Stop signal handler since we're done
-	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
-
-	log.Success("Cluster maintenance completed successfully")
 	return nil
 }
 

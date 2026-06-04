@@ -13,27 +13,49 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// Default Strimzi API group/versions. These have changed across Strimzi
+// releases (e.g. Kafka moved through v1beta1 -> v1beta2, and StrimziPodSet
+// lives under core.strimzi.io), so they are configurable via CLI flags.
+const (
+	// DefaultKafkaAPIVersion is the default group/version for the Kafka CR.
+	DefaultKafkaAPIVersion = "kafka.strimzi.io/v1beta2"
+	// DefaultStrimziPodSetAPIVersion is the default group/version for StrimziPodSet.
+	DefaultStrimziPodSetAPIVersion = "core.strimzi.io/v1beta2"
+)
+
 // KafkaOperations implements KafkaOperator interface
 type KafkaOperations struct {
-	clientset K8sClient
-	parallel  int
-	timeout   int
-	dryRun    bool
-	log       *logger.Logger
-	minAge    *time.Duration
-	skipWait  bool
+	clientset     K8sClient
+	parallel      int
+	timeout       int
+	dryRun        bool
+	log           *logger.Logger
+	minAge        *time.Duration
+	skipWait      bool
+	kafkaAPIPath  string // e.g. /apis/kafka.strimzi.io/v1beta2
+	podSetAPIPath string // e.g. /apis/core.strimzi.io/v1beta2
 }
 
-// NewKafkaOperations creates a new KafkaOperations instance
-func NewKafkaOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, skipWait bool) *KafkaOperations {
+// NewKafkaOperations creates a new KafkaOperations instance.
+// kafkaAPIVersion and podSetAPIVersion are group/version strings (e.g.
+// "kafka.strimzi.io/v1beta2"); empty values fall back to the defaults.
+func NewKafkaOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, skipWait bool, kafkaAPIVersion, podSetAPIVersion string) *KafkaOperations {
+	if kafkaAPIVersion == "" {
+		kafkaAPIVersion = DefaultKafkaAPIVersion
+	}
+	if podSetAPIVersion == "" {
+		podSetAPIVersion = DefaultStrimziPodSetAPIVersion
+	}
 	return &KafkaOperations{
-		clientset: clientset,
-		parallel:  parallel,
-		timeout:   timeout,
-		dryRun:    dryRun,
-		log:       logger.NewLogger(dryRun),
-		minAge:    minAge,
-		skipWait:  skipWait,
+		clientset:     clientset,
+		parallel:      parallel,
+		timeout:       timeout,
+		dryRun:        dryRun,
+		log:           logger.NewLogger(dryRun),
+		minAge:        minAge,
+		skipWait:      skipWait,
+		kafkaAPIPath:  "/apis/" + strings.TrimPrefix(kafkaAPIVersion, "/apis/"),
+		podSetAPIPath: "/apis/" + strings.TrimPrefix(podSetAPIVersion, "/apis/"),
 	}
 }
 
@@ -109,19 +131,28 @@ func (k *KafkaOperations) RestartKafkaClusters(ctx context.Context, namespaces [
 func (k *KafkaOperations) restartKafkaClustersInNamespace(ctx context.Context, namespace string) (bool, error) {
 	k.log.Info("Checking for Kafka clusters in namespace %s", namespace)
 
-	// Check if Kafka CRD exists
-	_, err := k.clientset.RESTClient().Get().AbsPath("/apis/kafka.strimzi.io/v1beta2").DoRaw(ctx)
+	// Check if Kafka CRD exists. On clusters without Strimzi installed the
+	// apiserver returns a "not found" error; treat that as "no Kafka" and skip
+	// cleanly, mirroring the Elasticsearch/PostgreSQL operators.
+	_, err := k.clientset.RESTClient().Get().AbsPath(k.kafkaAPIPath).DoRaw(ctx)
 	if err != nil {
+		if isNotFoundErr(err) {
+			k.log.Info("Kafka CRD (%s) not found, skipping Kafka operations", k.kafkaAPIPath)
+			return false, nil
+		}
 		return false, fmt.Errorf("failed to check for Kafka CRD: %w", err)
 	}
 
 	// List Kafka clusters
 	kafkaList, err := k.clientset.RESTClient().Get().
-		AbsPath("/apis/kafka.strimzi.io/v1beta2").
+		AbsPath(k.kafkaAPIPath).
 		Namespace(namespace).
 		Resource("kafkas").
 		DoRaw(ctx)
 	if err != nil {
+		if isNotFoundErr(err) {
+			return false, nil
+		}
 		return false, fmt.Errorf("failed to list Kafka clusters in namespace %s: %w", namespace, err)
 	}
 
@@ -279,7 +310,7 @@ func (k *KafkaOperations) restartKafkaClustersInNamespace(ctx context.Context, n
 func (k *KafkaOperations) checkStrimziPodSetAPIExists(ctx context.Context) bool {
 	_, err := k.clientset.RESTClient().
 		Get().
-		AbsPath("/apis/core.strimzi.io/v1beta2").
+		AbsPath(k.podSetAPIPath).
 		Resource("strimzipodsets").
 		DoRaw(ctx)
 
@@ -290,18 +321,15 @@ func (k *KafkaOperations) checkStrimziPodSetAPIExists(ctx context.Context) bool 
 func (k *KafkaOperations) checkStrimziPodSetExists(ctx context.Context, namespace, name string) (bool, error) {
 	_, err := k.clientset.RESTClient().
 		Get().
-		AbsPath("/apis/core.strimzi.io/v1beta2").
+		AbsPath(k.podSetAPIPath).
 		Namespace(namespace).
 		Resource("strimzipodsets").
 		Name(name).
 		DoRaw(ctx)
 
 	if err != nil {
-		// Check if this is a "not found" type error
-		if strings.Contains(err.Error(), "not found") ||
-			strings.Contains(err.Error(), "could not find") ||
-			strings.Contains(err.Error(), "the server could not find the requested resource") {
-			// This is an expected case for optional components
+		// "not found" is an expected case for optional components
+		if isNotFoundErr(err) {
 			return false, nil
 		}
 		// This is an unexpected error
@@ -328,7 +356,7 @@ func (k *KafkaOperations) annotateStrimziPodSet(ctx context.Context, namespace, 
 
 	_, err = k.clientset.RESTClient().
 		Patch(types.MergePatchType).
-		AbsPath("/apis/core.strimzi.io/v1beta2").
+		AbsPath(k.podSetAPIPath).
 		Namespace(namespace).
 		Resource("strimzipodsets").
 		Name(name).

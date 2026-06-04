@@ -259,16 +259,18 @@ func (e *ElasticsearchOperations) applyRestartAnnotation(ctx context.Context, na
 		return fmt.Errorf("failed to get Elasticsearch cluster: %w", err)
 	}
 
-	// Parse the Elasticsearch CR to get nodeSets
+	// Parse the Elasticsearch CR to get nodeSets. Pointers let us detect which
+	// of the optional intermediate objects (podTemplate, metadata) are absent,
+	// so we can create them as needed.
 	var esCR struct {
 		Spec struct {
 			NodeSets []struct {
 				Name        string `json:"name"`
-				PodTemplate struct {
-					Metadata struct {
-						Annotations map[string]string `json:"annotations,omitempty"`
-					} `json:"metadata,omitempty"`
-				} `json:"podTemplate,omitempty"`
+				PodTemplate *struct {
+					Metadata *struct {
+						Annotations map[string]string `json:"annotations"`
+					} `json:"metadata"`
+				} `json:"podTemplate"`
 			} `json:"nodeSets"`
 		} `json:"spec"`
 	}
@@ -277,8 +279,14 @@ func (e *ElasticsearchOperations) applyRestartAnnotation(ctx context.Context, na
 		return fmt.Errorf("failed to parse Elasticsearch cluster: %w", err)
 	}
 
-	// Build JSON patch operations for each nodeSet
-	// We need to update annotations for each nodeSet separately using JSON Patch
+	// Build JSON patch operations for each nodeSet. We use "add" rather than
+	// "replace": RFC 6902 "replace" requires the target path to already exist,
+	// but podTemplate/metadata/annotations are all optional and are usually
+	// absent (especially on the first restart, before our annotation exists),
+	// which makes the apiserver reject the whole patch with "doc is missing
+	// path". "add" creates the value if missing and replaces it otherwise, but
+	// it still requires the parent object to exist, so when an intermediate
+	// object is absent we add it (with the annotations nested inside) instead.
 	type jsonPatchOperation struct {
 		Op    string      `json:"op"`
 		Path  string      `json:"path"`
@@ -288,22 +296,40 @@ func (e *ElasticsearchOperations) applyRestartAnnotation(ctx context.Context, na
 	var patchOps []jsonPatchOperation
 
 	for i, nodeSet := range esCR.Spec.NodeSets {
-		// Get existing annotations or create new map
+		// Merge any existing annotations with our restart annotation.
 		annotations := make(map[string]string)
-		if nodeSet.PodTemplate.Metadata.Annotations != nil {
+		if nodeSet.PodTemplate != nil && nodeSet.PodTemplate.Metadata != nil {
 			for k, v := range nodeSet.PodTemplate.Metadata.Annotations {
 				annotations[k] = v
 			}
 		}
-		// Add restart annotation
 		annotations["elastic.co/restartedAt"] = restartTimestamp
 
-		// Create patch operation for this nodeSet's annotations
-		patchOps = append(patchOps, jsonPatchOperation{
-			Op:    "replace",
-			Path:  fmt.Sprintf("/spec/nodeSets/%d/podTemplate/metadata/annotations", i),
-			Value: annotations,
-		})
+		switch {
+		case nodeSet.PodTemplate == nil:
+			// podTemplate absent: create it with the metadata/annotations nested.
+			patchOps = append(patchOps, jsonPatchOperation{
+				Op:   "add",
+				Path: fmt.Sprintf("/spec/nodeSets/%d/podTemplate", i),
+				Value: map[string]interface{}{
+					"metadata": map[string]interface{}{"annotations": annotations},
+				},
+			})
+		case nodeSet.PodTemplate.Metadata == nil:
+			// metadata absent: create it with the annotations nested.
+			patchOps = append(patchOps, jsonPatchOperation{
+				Op:    "add",
+				Path:  fmt.Sprintf("/spec/nodeSets/%d/podTemplate/metadata", i),
+				Value: map[string]interface{}{"annotations": annotations},
+			})
+		default:
+			// metadata exists: add/replace the annotations map directly.
+			patchOps = append(patchOps, jsonPatchOperation{
+				Op:    "add",
+				Path:  fmt.Sprintf("/spec/nodeSets/%d/podTemplate/metadata/annotations", i),
+				Value: annotations,
+			})
+		}
 	}
 
 	patchBytes, err := json.Marshal(patchOps)
