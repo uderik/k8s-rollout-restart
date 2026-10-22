@@ -5,12 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	"github.com/uderik/k8s-rollout-restart/pkg/operations"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// defaultParallelism bounds concurrent per-namespace requests.
+const defaultParallelism = 10
 
 // ClusterState represents the state of cluster components
 type ClusterState struct {
@@ -25,6 +32,10 @@ type NodeState struct {
 	Name          string `json:"name"`
 	Status        string `json:"status"`
 	Unschedulable bool   `json:"unschedulable"`
+	// CordonedByThisRun marks nodes cordoned by this run. They are always
+	// part of the report, even when no pod of the target namespaces runs on
+	// them any more.
+	CordonedByThisRun bool `json:"cordonedByThisRun,omitempty"`
 }
 
 // PodState represents the state of a pod
@@ -38,24 +49,120 @@ type PodState struct {
 
 // ComponentState represents the state of cluster components
 type ComponentState struct {
-	Deployments   int `json:"deployments"`
-	StatefulSets  int `json:"statefulSets"`
-	DaemonSets    int `json:"daemonSets"`
-	Kafka         int `json:"kafka"`
-	Postgresql    int `json:"postgresql"`
-	Elasticsearch int `json:"elasticsearch"`
+	Deployments  int `json:"deployments"`
+	StatefulSets int `json:"statefulSets"`
+	DaemonSets   int `json:"daemonSets"`
+	Kafka        int `json:"kafka"`
+	Postgresql   int `json:"postgresql"`
 }
 
 // Reporter handles cluster state reporting
 type Reporter struct {
 	client operations.K8sClient
+	log    *logger.Logger
+	// kafkaAPIVersion is the Kafka CR group/version (e.g.
+	// "kafka.strimzi.io/v1beta2"). Empty or the default means "discover the
+	// served version".
+	kafkaAPIVersion string
+	parallelism     int
+	// cordonedNodes returns the nodes cordoned by this run (may be nil).
+	cordonedNodes func() []string
+}
+
+// Option configures a Reporter.
+type Option func(*Reporter)
+
+// WithKafkaAPIVersion sets the Kafka CR group/version used to count Kafka
+// clusters (same format as --strimzi-kafka-api).
+func WithKafkaAPIVersion(gv string) Option {
+	return func(r *Reporter) { r.kafkaAPIVersion = gv }
+}
+
+// WithLogger makes the reporter log through l (typically the root logger, so
+// warnings follow the configured --output format instead of breaking JSON).
+func WithLogger(l *logger.Logger) Option {
+	return func(r *Reporter) {
+		if l != nil {
+			r.log = l
+		}
+	}
+}
+
+// WithParallelism bounds the number of namespaces processed concurrently.
+func WithParallelism(n int) Option {
+	return func(r *Reporter) {
+		if n > 0 {
+			r.parallelism = n
+		}
+	}
+}
+
+// WithCordonedNodes makes the report always include the nodes returned by
+// nodes (the nodes cordoned by this run), even if they no longer run pods of
+// the target namespaces.
+func WithCordonedNodes(nodes func() []string) Option {
+	return func(r *Reporter) { r.cordonedNodes = nodes }
 }
 
 // NewReporter creates a new Reporter instance
-func NewReporter(client operations.K8sClient) *Reporter {
-	return &Reporter{
-		client: client,
+func NewReporter(client operations.K8sClient, opts ...Option) *Reporter {
+	r := &Reporter{
+		client:      client,
+		log:         logger.NewLogger(false),
+		parallelism: defaultParallelism,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// resolveKafkaAPIPath returns the Kafka API path to use, or "" when the
+// Strimzi Kafka API is not installed (or cannot be resolved).
+func (r *Reporter) resolveKafkaAPIPath(ctx context.Context) string {
+	gv := strings.TrimPrefix(strings.TrimPrefix(r.kafkaAPIVersion, "/"), "apis/")
+	group, version := "kafka.strimzi.io", ""
+	if gv != "" && gv != operations.DefaultKafkaAPIVersion {
+		if i := strings.Index(gv, "/"); i >= 0 {
+			group, version = gv[:i], gv[i+1:]
+		} else {
+			group = gv
+		}
+	}
+	path, present, err := operations.ResolveAPIGroupVersion(ctx, r.client.RESTClient(), group, version, "v1", "v1beta2")
+	if err != nil {
+		r.log.Warning("Reporter: cannot resolve Kafka API, Kafka clusters will not be counted: %v", err)
+		return ""
+	}
+	if !present {
+		return ""
+	}
+	return path
+}
+
+// countCRs lists a custom resource in a namespace and returns the number of
+// items. A missing API (NotFound) counts as zero silently; any other error is
+// logged and also counts as zero so that reporting never blocks a restart.
+func (r *Reporter) countCRs(ctx context.Context, apiPath, namespace, resource string) int {
+	raw, err := r.client.RESTClient().Get().
+		AbsPath(apiPath).
+		Namespace(namespace).
+		Resource(resource).
+		DoRaw(ctx)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			r.log.Warning("Reporter: failed to list %s in namespace %s: %v", resource, namespace, err)
+		}
+		return 0
+	}
+	var list struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		r.log.Warning("Reporter: failed to parse %s in namespace %s: %v", resource, namespace, err)
+		return 0
+	}
+	return len(list.Items)
 }
 
 // GenerateReport generates a report of the current cluster state
@@ -88,142 +195,35 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 		}
 	}
 
-	// Process each namespace in parallel
-	type namespaceResult struct {
-		ns            string
-		pods          []PodState
-		deployments   int
-		statefulsets  int
-		kafka         int
-		postgresql    int
-		elasticsearch int
-		usedNodes     map[string]bool // track nodes used by pods in this namespace
-		err           error
+	kafkaAPIPath := r.resolveKafkaAPIPath(ctx)
+
+	// A fixed pool of workers processes the namespaces (no goroutine per
+	// namespace).
+	parallelism := r.parallelism
+	if parallelism < 1 {
+		parallelism = defaultParallelism
 	}
+	parallelism = min(parallelism, len(namespacesToCheck))
 
-	resultChan := make(chan namespaceResult, len(namespacesToCheck))
-	for _, ns := range namespacesToCheck {
-		go func(ns string) {
-			defer func() {
-				if r := recover(); r != nil {
-					resultChan <- namespaceResult{
-						ns:  ns,
-						err: fmt.Errorf("panic in namespace %s: %v", ns, r),
-					}
-				}
-			}()
-			result := namespaceResult{
-				ns:        ns,
-				usedNodes: make(map[string]bool),
+	results := make([]namespaceResult, len(namespacesToCheck))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < parallelism; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i] = r.collectNamespace(ctx, namespacesToCheck[i], kafkaAPIPath)
 			}
-
-			// Get pods in namespace
-			pods, err := r.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				result.err = fmt.Errorf("failed to list pods in namespace %s: %w", ns, err)
-				resultChan <- result
-				return
-			}
-
-			// Process pod info for this namespace
-			for _, pod := range pods.Items {
-				// Track nodes that have pods in this namespace
-				if pod.Spec.NodeName != "" {
-					result.usedNodes[pod.Spec.NodeName] = true
-				}
-
-				podInfo := PodState{
-					Name:     pod.Name,
-					Status:   string(pod.Status.Phase),
-					Ready:    isPodReady(&pod),
-					Restarts: getTotalRestarts(&pod),
-					Age:      time.Since(pod.CreationTimestamp.Time).Round(time.Second).String(),
-				}
-				result.pods = append(result.pods, podInfo)
-			}
-
-			// Get deployments
-			deployments, err := r.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				result.err = fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
-				resultChan <- result
-				return
-			}
-			result.deployments = len(deployments.Items)
-
-			// Get statefulsets
-			statefulsets, err := r.client.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				result.err = fmt.Errorf("failed to list statefulsets in namespace %s: %w", ns, err)
-				resultChan <- result
-				return
-			}
-			result.statefulsets = len(statefulsets.Items)
-
-			// Count Kafka resources if available
-			kafkaList, err := r.client.RESTClient().Get().
-				AbsPath("/apis/kafka.strimzi.io/v1beta2").
-				Namespace(ns).
-				Resource("kafkas").
-				DoRaw(ctx)
-			if err == nil {
-				var kafkaResult struct {
-					Items []struct {
-						Metadata struct {
-							Name string `json:"name"`
-						} `json:"metadata"`
-					} `json:"items"`
-				}
-				if err := json.Unmarshal(kafkaList, &kafkaResult); err == nil {
-					result.kafka = len(kafkaResult.Items)
-				}
-			}
-
-			// Count PostgreSQL resources if available
-			postgresqlList, err := r.client.RESTClient().Get().
-				AbsPath("/apis/acid.zalan.do/v1").
-				Namespace(ns).
-				Resource("postgresqls").
-				DoRaw(ctx)
-			if err == nil {
-				var postgresqlResult struct {
-					Items []struct {
-						Metadata struct {
-							Name string `json:"name"`
-						} `json:"metadata"`
-					} `json:"items"`
-				}
-				if err := json.Unmarshal(postgresqlList, &postgresqlResult); err == nil {
-					result.postgresql = len(postgresqlResult.Items)
-				}
-			}
-
-			// Count Elasticsearch resources if available
-			elasticsearchList, err := r.client.RESTClient().Get().
-				AbsPath("/apis/elasticsearch.k8s.elastic.co/v1").
-				Namespace(ns).
-				Resource("elasticsearches").
-				DoRaw(ctx)
-			if err == nil {
-				var elasticsearchResult struct {
-					Items []struct {
-						Metadata struct {
-							Name string `json:"name"`
-						} `json:"metadata"`
-					} `json:"items"`
-				}
-				if err := json.Unmarshal(elasticsearchList, &elasticsearchResult); err == nil {
-					result.elasticsearch = len(elasticsearchResult.Items)
-				}
-			}
-
-			resultChan <- result
-		}(ns)
+		}()
 	}
+	for i := range namespacesToCheck {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
 
-	// Process namespace results
-	for i := 0; i < len(namespacesToCheck); i++ {
-		result := <-resultChan
+	for _, result := range results {
 		if result.err != nil {
 			return nil, result.err
 		}
@@ -233,27 +233,99 @@ func (r *Reporter) GenerateReport(ctx context.Context, namespaces []string) (*Cl
 		report.Components.StatefulSets += result.statefulsets
 		report.Components.Kafka += result.kafka
 		report.Components.Postgresql += result.postgresql
-		report.Components.Elasticsearch += result.elasticsearch
 
-		// Merge used nodes from this namespace
 		for nodeName := range result.usedNodes {
 			usedNodes[nodeName] = true
 		}
 	}
 
-	// Add only nodes that have pods in our namespaces
+	cordoned := make(map[string]bool)
+	if r.cordonedNodes != nil {
+		for _, name := range r.cordonedNodes() {
+			cordoned[name] = true
+		}
+	}
+
+	// Nodes that have pods in our namespaces, plus every node cordoned by
+	// this run (it may have been emptied by the restart).
 	for _, node := range nodes.Items {
-		if usedNodes[node.Name] {
-			nodeInfo := NodeState{
-				Name:          node.Name,
-				Status:        getNodeStatus(&node),
-				Unschedulable: node.Spec.Unschedulable,
-			}
-			report.Nodes = append(report.Nodes, nodeInfo)
+		if usedNodes[node.Name] || cordoned[node.Name] {
+			report.Nodes = append(report.Nodes, NodeState{
+				Name:              node.Name,
+				Status:            getNodeStatus(&node),
+				Unschedulable:     node.Spec.Unschedulable,
+				CordonedByThisRun: cordoned[node.Name],
+			})
 		}
 	}
 
 	return report, nil
+}
+
+// namespaceResult is what the report collects from one namespace.
+type namespaceResult struct {
+	ns           string
+	pods         []PodState
+	deployments  int
+	statefulsets int
+	kafka        int
+	postgresql   int
+	usedNodes    map[string]bool // nodes running pods of this namespace
+	err          error
+}
+
+// collectNamespace gathers the report data of one namespace.
+func (r *Reporter) collectNamespace(ctx context.Context, ns, kafkaAPIPath string) (result namespaceResult) {
+	result = namespaceResult{ns: ns, usedNodes: make(map[string]bool)}
+	defer func() {
+		if p := recover(); p != nil {
+			result = namespaceResult{ns: ns, err: fmt.Errorf("panic in namespace %s: %v", ns, p)}
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		result.err = fmt.Errorf("namespace %s: %w", ns, err)
+		return result
+	}
+
+	pods, err := r.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		result.err = fmt.Errorf("failed to list pods in namespace %s: %w", ns, err)
+		return result
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Spec.NodeName != "" {
+			result.usedNodes[pod.Spec.NodeName] = true
+		}
+		result.pods = append(result.pods, PodState{
+			Name:     pod.Name,
+			Status:   string(pod.Status.Phase),
+			Ready:    isPodReady(pod),
+			Restarts: getTotalRestarts(pod),
+			Age:      time.Since(pod.CreationTimestamp.Time).Round(time.Second).String(),
+		})
+	}
+
+	deployments, err := r.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		result.err = fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
+		return result
+	}
+	result.deployments = len(deployments.Items)
+
+	statefulsets, err := r.client.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		result.err = fmt.Errorf("failed to list statefulsets in namespace %s: %w", ns, err)
+		return result
+	}
+	result.statefulsets = len(statefulsets.Items)
+
+	// Count operator-managed resources if their APIs are available
+	if kafkaAPIPath != "" {
+		result.kafka = r.countCRs(ctx, kafkaAPIPath, ns, "kafkas")
+	}
+	result.postgresql = r.countCRs(ctx, "/apis/acid.zalan.do/v1", ns, "postgresqls")
+	return result
 }
 
 // ToJSON converts the cluster state to JSON format

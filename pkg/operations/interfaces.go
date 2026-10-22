@@ -16,12 +16,6 @@ type KafkaOperator interface {
 	RestartKafkaClusters(ctx context.Context, namespaces []string) error
 }
 
-// ElasticsearchOperator defines the interface for Elasticsearch cluster operations
-type ElasticsearchOperator interface {
-	// RestartElasticsearchClusters restarts all Elasticsearch clusters in the given namespaces
-	RestartElasticsearchClusters(ctx context.Context, namespaces []string) error
-}
-
 // DeploymentOperator defines the interface for deployment operations
 type DeploymentOperator interface {
 	// RestartDeployments restarts all deployments in the given namespaces
@@ -43,8 +37,8 @@ type ClusterOperator interface {
 	// CordonNodes cordons all nodes with pods from the namespaces or all nodes if cordonAllNodes is true
 	CordonNodes(ctx context.Context, namespaces []string, cordonAllNodes bool, nodeLabels []string, excludeLabels []string) error
 
-	// UncordonNodes uncordons all nodes previously cordoned
-	UncordonNodes(ctx context.Context, namespaces []string) error
+	// CordonedNodes returns the nodes cordoned by this run (never uncordoned by the tool)
+	CordonedNodes() []string
 }
 
 // K8sClient defines the interface for Kubernetes client operations
@@ -79,8 +73,24 @@ type PodInterface interface {
 type NodeInterface interface {
 	// List returns a list of nodes
 	List(ctx context.Context, opts metav1.ListOptions) (*corev1.NodeList, error)
-	// Update updates a node
-	Update(ctx context.Context, node *corev1.Node, opts metav1.UpdateOptions) (*corev1.Node, error)
+	// Patch patches a node
+	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*corev1.Node, error)
+}
+
+// PersistentVolumeLister is an OPTIONAL extension of CoreV1Interface. When the
+// CoreV1 implementation also provides it, cordon uses it to warn about pods
+// whose PVCs are bound to node-local PersistentVolumes. It is kept separate
+// from CoreV1Interface so existing implementations (and test fakes) do not
+// have to implement it.
+type PersistentVolumeLister interface {
+	// PersistentVolumes returns interface for working with persistent volumes
+	PersistentVolumes() PersistentVolumeInterface
+}
+
+// PersistentVolumeInterface is an interface for persistent volume operations
+type PersistentVolumeInterface interface {
+	// List returns a list of persistent volumes
+	List(ctx context.Context, opts metav1.ListOptions) (*corev1.PersistentVolumeList, error)
 }
 
 // NamespaceInterface is an interface for namespace operations

@@ -1,161 +1,104 @@
 # Pod Annotations Filter Examples
 
-This document provides examples of using the `--pod-annotations` flag to selectively restart resources based on pod annotations.
+This document provides examples of using the `--pod-annotations` flag to selectively restart Deployments and StatefulSets based on the annotations of their pods.
+
+A resource is selected when **at least one** of its pods (pods linked to it through the controller owner UID chain: Pod → ReplicaSet → Deployment, Pod → StatefulSet) has **all** the specified annotations with exactly the specified values.
 
 ## Basic Usage
 
-### Restart only Istio canary deployments (using annotations)
+### Restart only workloads whose pods use the Istio canary revision
 ```bash
-# Restart only deployments with pods annotated as Istio canary
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --execute
 ```
 
-### Restart only Istio default deployments (using annotations)
+### Restart only workloads whose pods use the Istio default revision
 ```bash
-# Restart only deployments with pods annotated as Istio default
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=default --execute
 ```
 
 ## Multiple Annotations
 
-### Restart resources with multiple specific annotations
+### Restart resources whose pods have several specific annotations
 ```bash
-# Restart only resources with pods having both istio.io/rev=canary and deployment.kubernetes.io/revision=1
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary,deployment.kubernetes.io/revision=1 --execute
-```
-
-### Restart resources with monitoring annotations
-```bash
-# Restart only resources with pods having Prometheus monitoring enabled
+# All listed annotations must match on the same pod (AND logic)
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=prometheus.io/scrape=true,prometheus.io/port=8080 --execute
 ```
 
 ## Combined Filters
 
-### Restart with annotations and age filter
+### Annotations and age filter
 ```bash
-# Restart only resources older than 1 hour with specific pod annotations
+# Restart only resources older than 1 hour whose pods have the annotation
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --older-than=1h --execute
 ```
 
-### Restart with annotations and resource type filter
+### Annotations and resource type filter
 ```bash
-# Restart only StatefulSets with specific pod annotations
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --resources=statefulsets --pod-annotations=statefulset.kubernetes.io/pod-name=mydb-0 --execute
+# Restart only StatefulSets whose pods have the annotation
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --resources=statefulsets --pod-annotations=prometheus.io/scrape=true --execute
 ```
 
-### Restart with both labels and annotations
+Pod filters apply only to `deployments` and `statefulsets`; they cannot be combined with operator-managed resource types (`strimzi-kafka`, `zalando-postgresql`, or `all`).
+
+### Labels and annotations together
 ```bash
-# Restart only resources with specific labels AND annotations
+# Restart only resources whose pods have the label AND the annotation
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=app=myapp --pod-annotations=istio.io/rev=canary --execute
 ```
 
-### Restart with annotations and node cordoning
+### Annotations and node cordoning
 ```bash
-# Restart resources with specific pod annotations and cordon nodes
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --cordon --execute
 ```
 
-## Dry Run Examples
+### Across all namespaces
+```bash
+# kube-system and kube-public are always skipped with -A
+./k8s-rollout-restart --context=my-cluster --all-namespaces --pod-annotations=istio.io/rev=canary --dry-run
+```
+
+## Dry Run
 
 ### Preview what would be restarted
 ```bash
-# See which resources would be restarted with specific pod annotations
+# Lists the Deployments/StatefulSets that match the filter without changing anything
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --dry-run
 ```
 
-### Preview with JSON output
-```bash
-# Get detailed information about resources that would be restarted
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --dry-run --output=json
-```
+`--output=json` only switches the log format to structured JSON; it does not produce a separate machine-readable list of resources.
 
 ## Common Use Cases
 
-### Istio Canary Deployments
+### Istio revisions
 ```bash
-# Restart only canary deployments (using annotations)
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --execute
-
-# Restart only default deployments (using annotations)
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=default --execute
 ```
 
-### Kubernetes Deployment Revisions
+### Prometheus scraping
 ```bash
-# Restart only deployments with specific revision
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=deployment.kubernetes.io/revision=1 --execute
-
-# Restart only deployments with revision 2 or higher
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=deployment.kubernetes.io/revision=2 --execute
-```
-
-### Prometheus Monitoring
-```bash
-# Restart only resources with Prometheus monitoring enabled
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=prometheus.io/scrape=true --execute
-
-# Restart only resources with specific Prometheus configuration
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=prometheus.io/scrape=true,prometheus.io/port=8080,prometheus.io/path=/metrics --execute
 ```
 
-### StatefulSet Specific
+### Custom application annotations
 ```bash
-# Restart only StatefulSets with specific pod names
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=statefulset.kubernetes.io/pod-name=mydb-0 --execute
-
-# Restart only StatefulSets with specific pod names and app labels
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=app=mydb --pod-annotations=statefulset.kubernetes.io/pod-name=mydb-0 --execute
-```
-
-### Custom Application Annotations
-```bash
-# Restart only resources with custom application annotations
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=app.company.com/version=v1.2.3 --execute
-
-# Restart only resources with custom feature flags
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=feature.new-ui=enabled --execute
-```
-
-### Environment-specific Filtering
-```bash
-# Restart only resources in production environment
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=environment=production --execute
-
-# Restart only resources in staging environment with specific version
 ./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=environment=staging,version=v1.0.0 --execute
 ```
 
-## Troubleshooting
-
-### Check which resources have specific annotations
+### Annotation present with an empty value
 ```bash
-# Use dry-run to see which resources match your criteria
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --dry-run
-```
-
-### Debug with verbose logging
-```bash
-# Add more detailed logging to see the filtering process
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=istio.io/rev=canary --dry-run --output=json
-```
-
-### Check both labels and annotations
-```bash
-# Check resources with both specific labels and annotations
-./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-labels=app=myapp --pod-annotations=istio.io/rev=canary --dry-run
+# Matches only pods that HAVE the annotation "example.com/flag" with an empty value.
+# Pods without the annotation do not match.
+./k8s-rollout-restart --context=my-cluster --namespace=my-namespace --pod-annotations=example.com/flag= --dry-run
 ```
 
 ## Notes
 
-- The `--pod-annotations` flag works with both Deployments and StatefulSets
-- All specified annotations must match for a resource to be restarted (AND logic)
-- The utility automatically finds pods associated with each resource through various methods:
-  - Direct label selectors (`app=<resource-name>`)
-  - Owner references (for ReplicaSets and StatefulSets)
-  - Alternative label patterns
-- If no pods are found for a resource, it will be skipped
-- The flag can be combined with other filters like `--older-than`, `--resources`, `--pod-labels`, etc.
-- Both `--pod-labels` and `--pod-annotations` can be used together (AND logic)
-- Annotations are case-sensitive and must match exactly
-- Empty values in annotations are supported (e.g., `key=`)
+- Works with Deployments and StatefulSets only.
+- Format is `key=value`; values without `=` are rejected.
+- All specified annotations must match on the same pod (AND logic); values are compared exactly and case-sensitively (no prefix/range matching).
+- Pods are matched to a resource through the controller owner chain by UID (Pod → ReplicaSet → Deployment, Pod → StatefulSet), not via `spec.selector`: pods of another workload that merely share labels are never counted. If a resource currently has no pods, it is skipped.
+- Annotations Kubernetes sets on other objects are not pod annotations: `deployment.kubernetes.io/revision` lives on Deployments/ReplicaSets, and `statefulset.kubernetes.io/pod-name` is a pod **label** (use `--pod-labels` for it).
+- Can be combined with `--older-than`, `--pod-labels`, `--container-image`, `--resources=deployments,statefulsets`, `--cordon`.

@@ -2,19 +2,29 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
-	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// DeploymentOperations implements DeploymentOperator interface
+// DeploymentOperations implements DeploymentOperator interface.
+//
+// Concurrency semantics of --parallel: targets are first selected in every
+// namespace (at most --parallel namespaces at once), then a pool of --parallel
+// workers processes them globally across namespaces. A worker patches one
+// Deployment, waits for its rollout to complete (bounded per resource by
+// --timeout) and only then takes the next one, so at most --parallel rollouts
+// are in progress at any time. With --skip-wait the worker does not wait, so
+// --parallel only bounds concurrent PATCH requests. Any failure stops new
+// launches, with or without --skip-wait.
 type DeploymentOperations struct {
 	clientset            K8sClient
 	parallel             int
@@ -25,383 +35,523 @@ type DeploymentOperations struct {
 	minAge               *time.Duration
 	podLabels            []string
 	podAnnotations       []string
+	containerImages      []string          // restart only resources whose pods run a matching container image
 	parsedPodLabels      map[string]string // cached parsed pod labels
 	parsedPodAnnotations map[string]string // cached parsed pod annotations
 	skipWait             bool
+	runStop              *RunStop      // run-wide stop signal shared with the other resource types
+	pollInterval         time.Duration // readiness poll interval (defaultPollInterval when zero)
+}
+
+// SetLogger replaces the logger (the configured root logger, so that
+// --output=json applies to every line).
+func (d *DeploymentOperations) SetLogger(l *logger.Logger) {
+	if l != nil {
+		d.log = l
+	}
+}
+
+// SetRunStop sets the run-wide stop signal shared by all resource types: a
+// failure here stops launches of the other types and vice versa.
+func (d *DeploymentOperations) SetRunStop(rs *RunStop) {
+	d.runStop = rs
 }
 
 // NewDeploymentOperations creates a new DeploymentOperations instance
-func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *DeploymentOperations {
+func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, containerImages []string, skipWait bool) *DeploymentOperations {
+	log := logger.NewLogger(dryRun)
+	parsedLabels, err := ParseLabelsOrAnnotationsStrict(podLabels)
+	if err != nil {
+		log.Warning("Ignoring malformed pod label filters: %v", err)
+	}
+	parsedAnnotations, err := ParseLabelsOrAnnotationsStrict(podAnnotations)
+	if err != nil {
+		log.Warning("Ignoring malformed pod annotation filters: %v", err)
+	}
 	return &DeploymentOperations{
 		clientset:            clientset,
 		parallel:             parallel,
 		timeout:              timeout,
 		dryRun:               dryRun,
 		noFlagger:            noFlagger,
-		log:                  logger.NewLogger(dryRun),
+		log:                  log,
 		minAge:               minAge,
 		podLabels:            podLabels,
 		podAnnotations:       podAnnotations,
-		parsedPodLabels:      ParseLabelsOrAnnotations(podLabels),
-		parsedPodAnnotations: ParseLabelsOrAnnotations(podAnnotations),
+		containerImages:      containerImages,
+		parsedPodLabels:      parsedLabels,
+		parsedPodAnnotations: parsedAnnotations,
 		skipWait:             skipWait,
 	}
 }
 
-// RestartDeployments restarts all deployments in the given namespaces
+// requiredPodLabels returns the parsed pod label requirements. Instances built
+// without the constructor (tests) are parsed on the fly.
+func (d *DeploymentOperations) requiredPodLabels() map[string]string {
+	if d.parsedPodLabels == nil {
+		return ParseLabelsOrAnnotations(d.podLabels)
+	}
+	return d.parsedPodLabels
+}
+
+// requiredPodAnnotations returns the parsed pod annotation requirements.
+func (d *DeploymentOperations) requiredPodAnnotations() map[string]string {
+	if d.parsedPodAnnotations == nil {
+		return ParseLabelsOrAnnotations(d.podAnnotations)
+	}
+	return d.parsedPodAnnotations
+}
+
+// hasPodFilters reports whether any pod-level filter (labels, annotations, or
+// container image) is active, based on the parsed (valid) filter values.
+func (d *DeploymentOperations) hasPodFilters() bool {
+	return len(d.requiredPodLabels()) > 0 ||
+		len(d.requiredPodAnnotations()) > 0 ||
+		len(nonEmptyStrings(d.containerImages)) > 0
+}
+
+// podMatchesFilters reports whether a pod satisfies all active pod-level filters
+// (required labels AND required annotations AND container image).
+func (d *DeploymentOperations) podMatchesFilters(pod *corev1.Pod) bool {
+	return d.podHasRequiredLabels(pod.Labels) &&
+		d.podHasRequiredAnnotations(pod.Annotations) &&
+		PodMatchesAnyImage(pod, d.containerImages)
+}
+
+// podHasRequiredLabels checks if a pod has all the required labels
+func (d *DeploymentOperations) podHasRequiredLabels(podLabels map[string]string) bool {
+	return MatchesRequirements(podLabels, d.requiredPodLabels())
+}
+
+// podHasRequiredAnnotations checks if a pod has all the required annotations
+func (d *DeploymentOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
+	return MatchesRequirements(podAnnotations, d.requiredPodAnnotations())
+}
+
+// deploymentCandidate is a Deployment selected for restart.
+type deploymentCandidate struct {
+	deployment appsv1.Deployment
+	reason     string
+}
+
+// deploymentSelection is the result of selecting Deployments in one namespace.
+// It is shared by the dry-run preview and the execute path so both always
+// agree on what will be restarted.
+type deploymentSelection struct {
+	namespace      string
+	total          int
+	toRestart      []deploymentCandidate
+	hasPrimary     []string // Flagger targets skipped because their primary is managed by Flagger
+	tooYoung       []appsv1.Deployment
+	noMatchingPods []string
+	paused         []string
+}
+
+// isFlaggerPrimary reports whether the deployment is a Flagger-managed primary.
+func (d *DeploymentOperations) isFlaggerPrimary(deployment appsv1.Deployment) bool {
+	return strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment)
+}
+
+// selectDeployments decides which Deployments in a namespace will be
+// restarted. The Flagger primary/target relationship is built from the full
+// Deployment list before any filter is applied, so filtering out a primary
+// (e.g. by --min-age) never causes its canary target to be restarted instead.
+func (d *DeploymentOperations) selectDeployments(ctx context.Context, namespace string) (*deploymentSelection, error) {
+	deployments, err := d.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list deployments in namespace %s: %w", namespace, err)
+	}
+
+	sel := &deploymentSelection{namespace: namespace, total: len(deployments.Items)}
+
+	flaggerPrimaries := make(map[string]bool)
+	if !d.noFlagger {
+		for _, deployment := range deployments.Items {
+			if d.isFlaggerPrimary(deployment) {
+				flaggerPrimaries[deployment.Name] = true
+			}
+		}
+	}
+
+	// Flagger classification and cheap filters first.
+	var candidates []deploymentCandidate
+	for _, deployment := range deployments.Items {
+		reason := "(no primary counterpart)"
+		if d.noFlagger {
+			reason = "(Flagger filter disabled)"
+		} else if flaggerPrimaries[deployment.Name] {
+			reason = "(Flagger primary deployment)"
+		} else if flaggerPrimaries[deployment.Name+"-primary"] {
+			sel.hasPrimary = append(sel.hasPrimary, deployment.Name)
+			continue
+		}
+
+		if d.minAge != nil && time.Since(deployment.CreationTimestamp.Time) < *d.minAge {
+			sel.tooYoung = append(sel.tooYoung, deployment)
+			continue
+		}
+
+		candidates = append(candidates, deploymentCandidate{deployment: deployment, reason: reason})
+	}
+
+	// Pod-level filters, using controller ownership rather than selectors.
+	if d.hasPodFilters() && len(candidates) > 0 {
+		matching, err := d.deploymentsWithMatchingPods(ctx, namespace)
+		if err != nil {
+			return nil, err
+		}
+		filtered := candidates[:0]
+		for _, c := range candidates {
+			if !matching[c.deployment.UID] {
+				sel.noMatchingPods = append(sel.noMatchingPods, c.deployment.Name)
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		candidates = filtered
+	}
+
+	// A paused Deployment does not roll out template changes; patching it
+	// would only leave a pending change behind and waiting would time out.
+	for _, c := range candidates {
+		if c.deployment.Spec.Paused {
+			sel.paused = append(sel.paused, c.deployment.Name)
+			continue
+		}
+		sel.toRestart = append(sel.toRestart, c)
+	}
+
+	return sel, nil
+}
+
+// deploymentsWithMatchingPods returns the UIDs of Deployments that control at
+// least one pod satisfying the active pod filters. Ownership is verified via
+// the controller chain Pod -> ReplicaSet -> Deployment, so pods of another
+// workload with an overlapping selector are never attributed to a Deployment.
+func (d *DeploymentOperations) deploymentsWithMatchingPods(ctx context.Context, namespace string) (map[types.UID]bool, error) {
+	pods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+	}
+
+	matchingRS := make(map[types.UID]bool)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !d.podMatchesFilters(pod) {
+			continue
+		}
+		if ref := metav1.GetControllerOf(pod); ref != nil && ref.Kind == "ReplicaSet" {
+			matchingRS[ref.UID] = true
+		}
+	}
+
+	result := make(map[types.UID]bool)
+	if len(matchingRS) == 0 {
+		return result, nil
+	}
+
+	replicaSets, err := d.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list replicasets in namespace %s: %w", namespace, err)
+	}
+	for i := range replicaSets.Items {
+		rs := &replicaSets.Items[i]
+		if !matchingRS[rs.UID] {
+			continue
+		}
+		if ref := metav1.GetControllerOf(rs); ref != nil && ref.Kind == "Deployment" {
+			result[ref.UID] = true
+		}
+	}
+	return result, nil
+}
+
+// selectAll runs selectDeployments for every namespace, with at most
+// d.parallel namespaces in flight. Errors are collected per namespace.
+func (d *DeploymentOperations) selectAll(ctx context.Context, namespaces []string) ([]*deploymentSelection, []error) {
+	sels := make([]*deploymentSelection, len(namespaces))
+	errs := make([]error, len(namespaces))
+	forEachBounded(d.parallel, len(namespaces), func(i int) {
+		if err := ctx.Err(); err != nil {
+			errs[i] = fmt.Errorf("namespace %s: deployments not selected: %w", namespaces[i], err)
+			return
+		}
+		sels[i], errs[i] = d.selectDeployments(ctx, namespaces[i])
+	})
+
+	var outSels []*deploymentSelection
+	var outErrs []error
+	for i := range namespaces {
+		if sels[i] != nil {
+			outSels = append(outSels, sels[i])
+		}
+		if errs[i] != nil {
+			outErrs = append(outErrs, errs[i])
+		}
+	}
+	return outSels, outErrs
+}
+
+// logSelection reports what was selected and skipped in a namespace.
+func (d *DeploymentOperations) logSelection(sel *deploymentSelection) {
+	ns := sel.namespace
+	if sel.total == 0 {
+		d.log.Info("No deployments found in namespace %s", ns)
+		return
+	}
+	d.log.Info("Found %d deployment(s) in namespace %s", sel.total, ns)
+
+	for _, name := range sel.hasPrimary {
+		d.log.Info("Skipping deployment %s/%s: has a Flagger primary counterpart", ns, name)
+	}
+	for _, deployment := range sel.tooYoung {
+		d.log.Info("Skipping deployment %s/%s: too new (age: %s, required: %s)", ns, deployment.Name,
+			time.Since(deployment.CreationTimestamp.Time).Round(time.Second), *d.minAge)
+	}
+	for _, name := range sel.noMatchingPods {
+		d.log.Info("Skipping deployment %s/%s: no pods matching the requested labels/annotations/image", ns, name)
+	}
+	for _, name := range sel.paused {
+		d.log.Warning("Skipping deployment %s/%s: deployment is paused (spec.paused=true); resume it to restart", ns, name)
+	}
+
+	if len(sel.toRestart) == 0 {
+		d.log.Info("No deployments found to restart in namespace %s", ns)
+		return
+	}
+	verb := "Will restart"
+	if d.dryRun {
+		verb = "Would restart"
+	}
+	d.log.Info("%s %d/%d deployment(s) in namespace %s", verb, len(sel.toRestart), sel.total, ns)
+	if d.dryRun {
+		for _, c := range sel.toRestart {
+			d.log.Info("- %s %s", c.deployment.Name, c.reason)
+		}
+	}
+}
+
+// DeploymentPlan is the precomputed restart plan of the Deployments of a run:
+// the Deployments selected in every namespace plus the selection errors. The
+// dry run previews it and the execute path restarts exactly these targets
+// (RestartPlannedDeployments), so both always agree.
+type DeploymentPlan struct {
+	jobs []deploymentJob
+	errs []error
+}
+
+// deploymentJob is one planned Deployment restart.
+type deploymentJob struct {
+	namespace string
+	candidate deploymentCandidate
+}
+
+// Targets returns "namespace/name" of every planned Deployment.
+func (p *DeploymentPlan) Targets() []string {
+	if p == nil {
+		return nil
+	}
+	out := make([]string, 0, len(p.jobs))
+	for _, j := range p.jobs {
+		out = append(out, j.namespace+"/"+j.candidate.deployment.Name)
+	}
+	return out
+}
+
+// Err returns the selection errors of the plan (nil when it is complete).
+func (p *DeploymentPlan) Err() error {
+	if p == nil {
+		return nil
+	}
+	return errors.Join(p.errs...)
+}
+
+// PlanDeployments selects the Deployments to restart in every namespace
+// (read-only) and logs the selection. The returned plan is never nil; the
+// error reports selection failures (e.g. a forbidden List in one namespace),
+// in which case the plan holds the targets of the other namespaces.
+func (d *DeploymentOperations) PlanDeployments(ctx context.Context, namespaces []string) (*DeploymentPlan, error) {
+	sels, errs := d.selectAll(ctx, namespaces)
+	for _, err := range errs {
+		d.log.Error("Failed to select deployments: %v", err)
+	}
+	plan := &DeploymentPlan{errs: errs}
+	for _, sel := range sels {
+		d.logSelection(sel)
+		for _, c := range sel.toRestart {
+			plan.jobs = append(plan.jobs, deploymentJob{namespace: sel.namespace, candidate: c})
+		}
+	}
+	return plan, plan.Err()
+}
+
+// RestartDeployments plans and restarts the Deployments of the given
+// namespaces (PlanDeployments + RestartPlannedDeployments).
 func (d *DeploymentOperations) RestartDeployments(ctx context.Context, namespaces []string) error {
 	if len(namespaces) == 0 {
 		d.log.Info("No namespaces specified, skipping deployments restart")
 		return nil
 	}
-
-	// Use errgroup for better parallel error handling
-	g, ctx := errgroup.WithContext(ctx)
-
-	for _, ns := range namespaces {
-		g.Go(func() error {
-			if err := d.restartDeploymentsInNamespace(ctx, ns); err != nil {
-				return fmt.Errorf("failed to restart deployments in namespace %s: %w", ns, err)
-			}
-			return nil
-		})
-	}
-
-	// Wait for all goroutines to complete and return first error if any
-	return g.Wait()
+	plan, _ := d.PlanDeployments(ctx, namespaces)
+	return d.RestartPlannedDeployments(ctx, plan)
 }
 
-// restartDeploymentsInNamespace restarts all deployments in a single namespace
-func (d *DeploymentOperations) restartDeploymentsInNamespace(ctx context.Context, namespace string) error {
-	// List all deployments in the namespace
-	deployments, err := d.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list deployments: %w", err)
-	}
-
-	if len(deployments.Items) == 0 {
-		d.log.Info("No deployments found in namespace %s", namespace)
+// RestartPlannedDeployments restarts the Deployments of a plan. The first
+// restart failure (PATCH rejected or ambiguous, rollout timed out or failed,
+// API error while waiting) stops launching further rollouts: rollouts already
+// in progress are still waited for, the remaining Deployments are reported as
+// "not started due to earlier failure". With --skip-wait any failed PATCH
+// stops further launches. A plan with selection errors trips the run-wide
+// stop before anything is launched, so no Deployment is restarted at all.
+// All errors are returned joined together.
+func (d *DeploymentOperations) RestartPlannedDeployments(ctx context.Context, plan *DeploymentPlan) error {
+	if plan == nil {
 		return nil
 	}
+	errs := append([]error(nil), plan.errs...)
+	// A selection error stops the run before anything is launched.
+	rs := tripOnSelectionErrors(d.runStop, errs)
+	jobs := plan.jobs
 
-	d.log.Info("Found %d deployment(s) in namespace %s", len(deployments.Items), namespace)
-
-	// Maps to track deployments and relationships
-	primaryDeployments := make(map[string]appsv1.Deployment)
-	regularDeployments := make(map[string]appsv1.Deployment)
-	deploymentsToRestart := make([]appsv1.Deployment, 0)
-	skippedDeployments := make([]appsv1.Deployment, 0)
-	tooYoungDeployments := make([]appsv1.Deployment, 0)
-
-	// First pass: categorize deployments as primary or regular
-	for _, deployment := range deployments.Items {
-		// Check if deployment is old enough to restart
-		if d.minAge != nil {
-			if time.Since(deployment.CreationTimestamp.Time) < *d.minAge {
-				tooYoungDeployments = append(tooYoungDeployments, deployment)
-				continue
-			}
-		}
-
-		// Check if deployment has pods with required labels or annotations
-		if len(d.podLabels) > 0 || len(d.podAnnotations) > 0 {
-			hasMatchingPods, err := d.hasPodsWithLabelsOrAnnotations(ctx, namespace, deployment.Name)
-			if err != nil {
-				d.log.Warning("Failed to check pods for deployment %s: %v", deployment.Name, err)
-				continue
-			}
-			if !hasMatchingPods {
-				d.log.Info("Skipping deployment %s: no pods with required labels or annotations", deployment.Name)
-				continue
-			}
-		}
-
-		if d.noFlagger {
-			// If --no-flagger-filter is set, restart all deployments
-			deploymentsToRestart = append(deploymentsToRestart, deployment)
-			continue
-		}
-
-		// Check if this is a primary deployment
-		if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
-			// This is a primary deployment managed by Flagger
-			primaryDeployments[deployment.Name] = deployment
-			continue
-		}
-
-		// This is a regular deployment
-		regularDeployments[deployment.Name] = deployment
+	if d.dryRun || len(jobs) == 0 {
+		return errors.Join(errs...)
 	}
 
-	// If not using --no-flagger-filter, apply special logic
-	if !d.noFlagger {
-		// Add all primary deployments to the restart list
-		for _, deployment := range primaryDeployments {
-			deploymentsToRestart = append(deploymentsToRestart, deployment)
-		}
-
-		// For regular deployments, check if they have a primary counterpart
-		for name, deployment := range regularDeployments {
-			primaryName := name + "-primary"
-			if _, hasPrimary := primaryDeployments[primaryName]; hasPrimary {
-				// This deployment has a primary counterpart, skip it
-				skippedDeployments = append(skippedDeployments, deployment)
-			} else {
-				// This deployment doesn't have a primary counterpart, restart it
-				deploymentsToRestart = append(deploymentsToRestart, deployment)
-			}
-		}
-	}
-
-	if len(deploymentsToRestart) == 0 {
-		d.log.Info("No deployments found to restart in namespace %s", namespace)
-		return nil
-	}
-
-	d.log.Info("Will restart %d/%d deployment(s) in namespace %s",
-		len(deploymentsToRestart), len(deployments.Items), namespace)
-
-	if d.dryRun {
-		d.log.Info("Deployments that would be restarted in namespace %s:", namespace)
-		for _, deployment := range deploymentsToRestart {
-			var reason string
-			if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
-				reason = "(Flagger primary deployment)"
-			} else {
-				reason = "(no primary counterpart)"
-			}
-			d.log.Info("- %s %s", deployment.Name, reason)
-		}
-
-		if len(skippedDeployments) > 0 {
-			d.log.Info("\nDeployments that would be skipped in namespace %s:", namespace)
-			for _, deployment := range skippedDeployments {
-				d.log.Info("- %s (has primary counterpart that will be restarted)", deployment.Name)
-			}
-		}
-
-		if len(tooYoungDeployments) > 0 {
-			d.log.Info("\nDeployments that would be skipped because they are too new in namespace %s:", namespace)
-			for _, deployment := range tooYoungDeployments {
-				d.log.Info("- %s (age: %s, required: %s)", deployment.Name,
-					time.Since(deployment.CreationTimestamp.Time).Round(time.Second),
-					*d.minAge)
-			}
-		}
-
-		return nil
-	}
-
-	// Create a worker pool for parallel processing
-	type restartJob struct {
-		namespace  string
-		deployment appsv1.Deployment
-	}
-
-	jobCh := make(chan restartJob, len(deploymentsToRestart))
-	workerErrCh := make(chan error, len(deploymentsToRestart))
-
-	// Start workers
-	var workerWg sync.WaitGroup
-	for i := 0; i < d.parallel; i++ {
-		workerWg.Add(1)
-		go func() {
-			defer workerWg.Done()
-			for job := range jobCh {
-				// Patch deployment to trigger a rolling update
-				patchData := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`, time.Now().Format(time.RFC3339))
-				_, err := d.clientset.AppsV1().Deployments(job.namespace).Patch(ctx, job.deployment.Name, types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
-				if err != nil {
-					workerErrCh <- fmt.Errorf("failed to patch deployment %s/%s: %w", job.namespace, job.deployment.Name, err)
-					continue // Continue processing other jobs instead of returning
-				}
-
-				d.log.Success("Successfully restarted deployment %s/%s", job.namespace, job.deployment.Name)
-			}
-		}()
-	}
-
-	// Send jobs to workers
-	for _, deployment := range deploymentsToRestart {
-		var reason string
-		if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
-			reason = "(Flagger primary deployment)"
-		} else {
-			reason = "(no primary counterpart)"
-		}
-		d.log.Info("Restarting deployment %s/%s %s", namespace, deployment.Name, reason)
-		jobCh <- restartJob{
-			namespace:  namespace,
-			deployment: deployment,
-		}
-	}
-
-	close(jobCh)
-	workerWg.Wait()
-	close(workerErrCh)
-
-	// Collect all errors
-	var errs []error
-	for err := range workerErrCh {
-		errs = append(errs, err)
-	}
-
-	// Return combined error if any errors occurred
-	if len(errs) > 0 {
-		return fmt.Errorf("errors during deployment restart: %v", errs)
-	}
-
-	if len(skippedDeployments) > 0 {
-		d.log.Info("Skipped %d deployment(s) in namespace %s that have primary counterparts",
-			len(skippedDeployments), namespace)
-	}
-
-	// Wait for all restarted deployments to be ready
-	if !d.skipWait {
-		d.log.Info("Waiting for deployments to become ready in namespace %s", namespace)
-		if err := d.waitForDeploymentsReady(ctx, namespace, deploymentsToRestart); err != nil {
-			return fmt.Errorf("failed waiting for deployments to become ready: %w", err)
-		}
-	} else {
+	if d.skipWait {
 		d.log.Info("Skipping wait for deployments readiness (--skip-wait flag is set)")
 	}
 
-	d.log.Success("Successfully restarted %d deployment(s) in namespace %s",
-		len(deploymentsToRestart), namespace)
+	// Each worker patches one Deployment and waits for its rollout before
+	// taking the next one, so at most d.parallel rollouts are in progress at
+	// any time across all namespaces. After a failure no new rollout is
+	// started (see stopsLaunches): a timed-out or ambiguous rollout may still
+	// be running in the cluster and keeps occupying its slot.
+	jobErrs, notStarted := runRolloutJobs(d.parallel, len(jobs), rs, func(i int) error {
+		return d.restartOne(ctx, rs, jobs[i].namespace, jobs[i].candidate)
+	}, func(err error) bool { return stopsLaunches(err) })
 
+	failed := 0
+	for i, err := range jobErrs {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrNotStartedEarlierFailure):
+			errs = append(errs, fmt.Errorf("deployment %s/%s: %w", jobs[i].namespace, jobs[i].candidate.deployment.Name, err))
+		default:
+			failed++
+			errs = append(errs, err)
+		}
+	}
+	if notStarted > 0 {
+		d.log.Error("%d deployment(s) not started due to earlier failure", notStarted)
+	}
+	switch {
+	case failed == 0 && notStarted == 0 && d.skipWait:
+		d.log.Success("Triggered restart of %d deployment(s)", len(jobs))
+	case failed == 0 && notStarted == 0:
+		d.log.Success("Successfully restarted %d deployment(s)", len(jobs))
+	default:
+		d.log.Error("%d of %d deployment restart(s) failed, %d not started", failed, len(jobs), notStarted)
+	}
+
+	return errors.Join(errs...)
+}
+
+// restartOne patches a single Deployment and, unless --skip-wait is set,
+// waits (bounded by --timeout) for its rollout to complete. An API error
+// while waiting trips rs at once.
+func (d *DeploymentOperations) restartOne(ctx context.Context, rs *RunStop, namespace string, c deploymentCandidate) error {
+	name := c.deployment.Name
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("deployment %s/%s not restarted: %w", namespace, name, err)
+	}
+	d.log.Info("Restarting deployment %s/%s %s", namespace, name, c.reason)
+	patched, err := d.clientset.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType, restartPatch(), metav1.PatchOptions{})
+	if err != nil {
+		err = &rolloutJobError{
+			err:       fmt.Errorf("failed to patch deployment %s/%s: %w", namespace, name, err),
+			ambiguous: patchOutcomeAmbiguous(err),
+		}
+		d.log.Error("%v", err)
+		return err
+	}
+	d.log.Success("Successfully triggered restart of deployment %s/%s", namespace, name)
+	if d.skipWait {
+		return nil
+	}
+	target := rolloutTarget{namespace: namespace, name: name, minGeneration: patched.Generation}
+	if err := d.waitForDeploymentsReady(ctx, []rolloutTarget{target}, rs.Trip); err != nil {
+		return fmt.Errorf("deployment %s/%s did not become ready: %w", namespace, name, err)
+	}
 	return nil
 }
 
-// waitForDeploymentsReady waits for all specified deployments to be ready after restart
-func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, namespace string, deployments []appsv1.Deployment) error {
-	if len(deployments) == 0 {
-		return nil
+// waitForDeploymentsReady waits for the restarted deployments to finish their
+// rollout. Every API call uses the bounded timeout context.
+func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, targets []rolloutTarget, trip func(error)) error {
+	check := func(ctx context.Context, t rolloutTarget) (bool, string, error, error) {
+		deployment, err := d.clientset.AppsV1().Deployments(t.namespace).Get(ctx, t.name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) && ctx.Err() == nil {
+				return false, "", fmt.Errorf("deployment no longer exists: %w", err), nil
+			}
+			return false, "", nil, err
+		}
+		done, reason, terminal := deploymentRolloutStatus(deployment, t.minGeneration)
+		return done, reason, terminal, nil
+	}
+	return waitForRollouts(ctx, d.log, "deployment", time.Duration(d.timeout)*time.Second, d.pollInterval, targets, check, trip)
+}
+
+// deploymentRolloutStatus reports whether a Deployment has completed its
+// rollout. minGeneration is the generation returned by the restart PATCH.
+//
+// Completion is derived from generation and replica counts only. The
+// Progressing condition is not required, because Kubernetes removes it when
+// progressDeadlineSeconds is MaxInt32; it is only used to fail fast when the
+// progress deadline has been exceeded.
+func deploymentRolloutStatus(deployment *appsv1.Deployment, minGeneration int64) (done bool, reason string, terminal error) {
+	generation := deployment.Generation
+	if minGeneration > generation {
+		generation = minGeneration
+	}
+	if deployment.Status.ObservedGeneration < generation {
+		return false, fmt.Sprintf("generation not observed yet (observed: %d, expected: %d)",
+			deployment.Status.ObservedGeneration, generation), nil
 	}
 
-	// Create a map of deployment names for quick lookup with their initial generation
-	deploymentGenerations := make(map[string]int64)
-	for _, deployment := range deployments {
-		deploymentGenerations[deployment.Name] = deployment.Generation
-	}
-
-	// Wait for deployments to be ready
-	d.log.Info("Waiting for %d deployment(s) in namespace %s to become ready", len(deployments), namespace)
-
-	// Create a timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(d.timeout)*time.Second)
-	defer cancel()
-
-	// Check every 5 seconds
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	// Track deployments that were ready in previous check
-	previouslyReady := make(map[string]bool)
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timeout waiting for deployments to be ready in namespace %s", namespace)
-		case <-ticker.C:
-			// Get current state of deployments
-			deploymentsReady := 0
-			totalDeployments := len(deploymentGenerations)
-			notReadyDeployments := make(map[string][]string)
-
-			// Check each deployment
-			for deploymentName := range deploymentGenerations {
-				// Get deployment status (cache manager will handle freshness with TTL)
-				deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
-				if err != nil {
-					d.log.Warning("Failed to get deployment %s/%s: %v", namespace, deploymentName, err)
-					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName], "Failed to get deployment status")
-					continue
-				}
-
-				// Check if deployment generation increased
-				if deployment.Status.ObservedGeneration < deployment.Generation {
-					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
-						fmt.Sprintf("Generation not updated (observed: %d, current: %d)",
-							deployment.Status.ObservedGeneration, deployment.Generation))
-					continue
-				}
-
-				// Check deployment conditions
-				progressing := false
-				replicaFailure := false
-
-				for _, condition := range deployment.Status.Conditions {
-					switch condition.Type {
-					case appsv1.DeploymentProgressing:
-						if condition.Status == "True" {
-							progressing = true
-						}
-					case appsv1.DeploymentReplicaFailure:
-						if condition.Status == "True" {
-							replicaFailure = true
-							notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
-								fmt.Sprintf("Replica failure: %s", condition.Message))
-						}
-					case appsv1.DeploymentAvailable:
-						// DeploymentAvailable condition is informational, no action needed
-					}
-				}
-
-				if !progressing {
-					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName], "Not progressing")
-					continue
-				}
-
-				if replicaFailure {
-					continue
-				}
-
-				// Check if all pods are updated to the new generation
-				if deployment.Status.UpdatedReplicas != *deployment.Spec.Replicas {
-					// If deployment was previously ready and has the same number of replicas, consider it ready
-					if previouslyReady[deploymentName] && deployment.Status.Replicas == *deployment.Spec.Replicas {
-						deploymentsReady++
-						continue
-					}
-					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
-						fmt.Sprintf("Pods updating (%d/%d updated)",
-							deployment.Status.UpdatedReplicas, *deployment.Spec.Replicas))
-					continue
-				}
-
-				// Check if all updated pods are ready
-				if deployment.Status.ReadyReplicas != *deployment.Spec.Replicas {
-					// If deployment was previously ready and has the same number of replicas, consider it ready
-					if previouslyReady[deploymentName] && deployment.Status.Replicas == *deployment.Spec.Replicas {
-						deploymentsReady++
-						continue
-					}
-					notReadyDeployments[deploymentName] = append(notReadyDeployments[deploymentName],
-						fmt.Sprintf("Pods starting (%d/%d ready)",
-							deployment.Status.ReadyReplicas, *deployment.Spec.Replicas))
-					continue
-				}
-
-				// Mark deployment as ready in this iteration
-				previouslyReady[deploymentName] = true
-				deploymentsReady++
+	var notes []string
+	for _, condition := range deployment.Status.Conditions {
+		switch condition.Type {
+		case appsv1.DeploymentProgressing:
+			if condition.Status == corev1.ConditionFalse && condition.Reason == "ProgressDeadlineExceeded" {
+				return false, "", fmt.Errorf("progress deadline exceeded: %s", condition.Message)
 			}
-
-			// Log progress
-			if deploymentsReady == totalDeployments {
-				d.log.Success("All deployments are ready in namespace %s", namespace)
-				return nil
-			}
-
-			d.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)",
-				namespace, deploymentsReady, totalDeployments)
-
-			// Log detailed status for not ready deployments
-			for name, reasons := range notReadyDeployments {
-				d.log.Info("Deployment %s not ready: %s", name, strings.Join(reasons, ", "))
+		case appsv1.DeploymentReplicaFailure:
+			if condition.Status == corev1.ConditionTrue {
+				notes = append(notes, fmt.Sprintf("replica failure: %s", condition.Message))
 			}
 		}
 	}
+
+	desired := int32(1)
+	if deployment.Spec.Replicas != nil {
+		desired = *deployment.Spec.Replicas
+	}
+	st := deployment.Status
+
+	switch {
+	case st.UpdatedReplicas != desired:
+		notes = append([]string{fmt.Sprintf("pods updating (%d/%d updated)", st.UpdatedReplicas, desired)}, notes...)
+	case st.Replicas != st.UpdatedReplicas:
+		notes = append([]string{fmt.Sprintf("old pods terminating (%d total, %d updated)", st.Replicas, st.UpdatedReplicas)}, notes...)
+	case st.AvailableReplicas != desired:
+		notes = append([]string{fmt.Sprintf("pods becoming available (%d/%d available)", st.AvailableReplicas, desired)}, notes...)
+	case st.ReadyReplicas != desired:
+		notes = append([]string{fmt.Sprintf("pods starting (%d/%d ready)", st.ReadyReplicas, desired)}, notes...)
+	default:
+		return true, "", nil
+	}
+	return false, strings.Join(notes, ", "), nil
 }
 
 // hasFlaggerCanaryOwner checks if the deployment has a Flagger Canary owner reference
@@ -416,268 +566,9 @@ func (d *DeploymentOperations) hasFlaggerCanaryOwner(deployment appsv1.Deploymen
 	return false
 }
 
-// isDeploymentReady checks if a deployment is ready
-func isDeploymentReady(deployment *appsv1.Deployment) bool {
-	return deployment.Status.ReadyReplicas == *deployment.Spec.Replicas &&
-		deployment.Status.UpdatedReplicas == *deployment.Spec.Replicas &&
-		deployment.Status.AvailableReplicas == *deployment.Spec.Replicas
-}
-
-// WaitForDeployments waits for all deployments in the specified namespaces to be ready
-func (d *DeploymentOperations) WaitForDeployments(ctx context.Context, namespaces []string) error {
-	d.log.Info("Waiting for deployments to be ready in namespaces: %v", namespaces)
-
-	// Create a timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(d.timeout)*time.Second)
-	defer cancel()
-
-	// Get all deployments first
-	allDeployments := make(map[string][]string)
-	for _, ns := range namespaces {
-		deployments, err := d.clientset.AppsV1().Deployments(ns).List(timeoutCtx, metav1.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
-		}
-		allDeployments[ns] = make([]string, 0, len(deployments.Items))
-		for _, deployment := range deployments.Items {
-			allDeployments[ns] = append(allDeployments[ns], deployment.Name)
-		}
-	}
-
-	// Wait for all deployments to be ready
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for _, ns := range namespaces {
-		if err := d.waitForNamespaceDeployments(timeoutCtx, ns, allDeployments[ns], ticker); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// waitForNamespaceDeployments waits for all deployments in a single namespace to be ready
-func (d *DeploymentOperations) waitForNamespaceDeployments(ctx context.Context, ns string, deployments []string, ticker *time.Ticker) error {
-	if len(deployments) == 0 {
-		d.log.Info("No deployments found in namespace %s", ns)
-		return nil
-	}
-
-	d.log.Info("Waiting for deployments to be ready in namespace %s (%d deployments)", ns, len(deployments))
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for deployments to be ready in namespace %s", ns)
-		case <-ticker.C:
-			readyCount := 0
-			for _, deploymentName := range deployments {
-				deployment, err := d.clientset.AppsV1().Deployments(ns).Get(ctx, deploymentName, metav1.GetOptions{})
-				if err != nil {
-					return fmt.Errorf("failed to get deployment %s/%s: %w", ns, deploymentName, err)
-				}
-
-				if isDeploymentReady(deployment) {
-					readyCount++
-				}
-			}
-
-			if readyCount == len(deployments) {
-				d.log.Info("All deployments are ready in namespace %s", ns)
-				return nil
-			}
-
-			d.log.Info("Waiting for deployments to be ready in namespace %s (%d/%d ready)", ns, readyCount, len(deployments))
-		}
-	}
-}
-
-// hasPodsWithLabelsOrAnnotations checks if a deployment has pods with the required labels or annotations
-func (d *DeploymentOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace, deploymentName string) (bool, error) {
-	// Get the deployment to access its selector
-	deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to get deployment %s: %w", deploymentName, err)
-	}
-
-	// Use the deployment's selector to find its pods
-	labelSelector := metav1.FormatLabelSelector(deployment.Spec.Selector)
-	pods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err != nil {
-		return false, fmt.Errorf("failed to list pods for deployment %s: %w", deploymentName, err)
-	}
-
-	// If no pods found, try to find pods by owner reference as fallback
-	if len(pods.Items) == 0 {
-		allPods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return false, fmt.Errorf("failed to list all pods in namespace %s: %w", namespace, err)
-		}
-
-		// Find pods owned by this deployment through ReplicaSets
-		for _, pod := range allPods.Items {
-			for _, owner := range pod.OwnerReferences {
-				if owner.Kind == "ReplicaSet" {
-					// Check if this ReplicaSet is owned by our deployment
-					rs, err := d.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
-					if err != nil {
-						continue
-					}
-					for _, rsOwner := range rs.OwnerReferences {
-						if rsOwner.Kind == "Deployment" && rsOwner.Name == deploymentName {
-							pods.Items = append(pods.Items, pod)
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Check if any pod has the required labels or annotations
-	for _, pod := range pods.Items {
-		if d.podHasRequiredLabels(pod.Labels) && d.podHasRequiredAnnotations(pod.Annotations) {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// podHasRequiredLabels checks if a pod has all the required labels
-func (d *DeploymentOperations) podHasRequiredLabels(podLabels map[string]string) bool {
-	// Use parsed labels if available (from constructor), otherwise parse on the fly (for tests)
-	requiredLabels := d.parsedPodLabels
-	if len(requiredLabels) == 0 && len(d.podLabels) > 0 {
-		// Fallback: parse labels on the fly for backward compatibility
-		requiredLabels = ParseLabelsOrAnnotations(d.podLabels)
-	}
-	return MatchesRequirements(podLabels, requiredLabels)
-}
-
-// podHasRequiredAnnotations checks if a pod has all the required annotations
-func (d *DeploymentOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
-	// Use parsed annotations if available (from constructor), otherwise parse on the fly (for tests)
-	requiredAnnotations := d.parsedPodAnnotations
-	if len(requiredAnnotations) == 0 && len(d.podAnnotations) > 0 {
-		// Fallback: parse annotations on the fly for backward compatibility
-		requiredAnnotations = ParseLabelsOrAnnotations(d.podAnnotations)
-	}
-	return MatchesRequirements(podAnnotations, requiredAnnotations)
-}
-
-// GetDeploymentsToRestart returns a list of deployments that would be restarted
+// GetDeploymentsToRestart returns "namespace/name" of every Deployment that
+// would be restarted (PlanDeployments).
 func (d *DeploymentOperations) GetDeploymentsToRestart(ctx context.Context, namespaces []string) ([]string, error) {
-	var allDeployments []string
-
-	for _, namespace := range namespaces {
-		deployments, err := d.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to list deployments in namespace %s: %w", namespace, err)
-		}
-
-		// Get all pods in the namespace once for efficient filtering
-		var podsWithMatchingLabels []string
-		if len(d.podLabels) > 0 || len(d.podAnnotations) > 0 {
-			allPods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
-			}
-
-			// Get all ReplicaSets in the namespace once to avoid multiple API calls
-			allReplicaSets, err := d.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, fmt.Errorf("failed to list replicasets in namespace %s: %w", namespace, err)
-			}
-
-			// Create a map of ReplicaSet name -> Deployment name
-			rsToDeployment := make(map[string]string)
-			for _, rs := range allReplicaSets.Items {
-				for _, owner := range rs.OwnerReferences {
-					if owner.Kind == "Deployment" {
-						rsToDeployment[rs.Name] = owner.Name
-						break
-					}
-				}
-			}
-
-			// Create a map of deployment names that have matching pods
-			deploymentPods := make(map[string]bool)
-			for _, pod := range allPods.Items {
-				// Check if pod has required labels and annotations
-				if d.podHasRequiredLabels(pod.Labels) && d.podHasRequiredAnnotations(pod.Annotations) {
-					// Find which deployment this pod belongs to
-					for _, owner := range pod.OwnerReferences {
-						if owner.Kind == "ReplicaSet" {
-							if deploymentName, exists := rsToDeployment[owner.Name]; exists {
-								deploymentPods[deploymentName] = true
-							}
-						}
-					}
-				}
-			}
-			podsWithMatchingLabels = make([]string, 0, len(deploymentPods))
-			for deploymentName := range deploymentPods {
-				podsWithMatchingLabels = append(podsWithMatchingLabels, deploymentName)
-			}
-		}
-
-		// Apply the same filtering logic as in RestartDeployments
-		for _, deployment := range deployments.Items {
-			// Check if deployment is old enough to restart
-			if d.minAge != nil {
-				if time.Since(deployment.CreationTimestamp.Time) < *d.minAge {
-					continue
-				}
-			}
-
-			// Check if deployment has pods with required labels or annotations
-			if len(d.podLabels) > 0 || len(d.podAnnotations) > 0 {
-				hasMatchingPods := false
-				for _, deploymentName := range podsWithMatchingLabels {
-					if deploymentName == deployment.Name {
-						hasMatchingPods = true
-						break
-					}
-				}
-				if !hasMatchingPods {
-					continue
-				}
-			}
-
-			// Apply Flagger logic
-			if !d.noFlagger {
-				// Check if this is a primary deployment
-				if strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment) {
-					allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
-					continue
-				}
-
-				// Check if this is a regular deployment without a primary counterpart
-				if !strings.HasSuffix(deployment.Name, "-primary") {
-					// Check if this deployment has a primary counterpart in the already loaded deployments
-					primaryName := deployment.Name + "-primary"
-					hasPrimary := false
-					for _, existingDeployment := range deployments.Items {
-						if existingDeployment.Name == primaryName {
-							hasPrimary = true
-							break
-						}
-					}
-					if !hasPrimary {
-						// No primary deployment found, this regular deployment will be restarted
-						allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
-					}
-				}
-			} else {
-				// If --no-flagger-filter is set, restart all deployments
-				allDeployments = append(allDeployments, fmt.Sprintf("%s/%s", namespace, deployment.Name))
-			}
-		}
-	}
-
-	return allDeployments, nil
+	plan, err := d.PlanDeployments(ctx, namespaces)
+	return plan.Targets(), err
 }

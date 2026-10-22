@@ -17,6 +17,12 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// RequestTimeout is the upper bound for a single Kubernetes API request
+// (rest.Config.Timeout). It is deliberately generous: it exists to stop a
+// stuck API server/connection from hanging the run, not to limit how long a
+// rollout may take (that is --timeout, enforced by the waiters).
+const RequestTimeout = 60 * time.Second
+
 // Client wraps Kubernetes client with additional functionality
 type Client struct {
 	clientset    kubernetes.Interface
@@ -41,6 +47,11 @@ func NewClient(context string, qps float32, burst int) (*Client, error) {
 	// Set the QPS and Burst limits for the client
 	config.QPS = qps
 	config.Burst = burst
+	// Bound every single API request. Long operations (rollout waits) are
+	// polling loops made of many short requests, so a per-request timeout
+	// never cuts a legitimate wait short, while a hung List/Patch in the
+	// execute path can no longer block the run forever.
+	config.Timeout = RequestTimeout
 
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -164,8 +175,22 @@ func (a *nodeAdapter) List(ctx context.Context, opts metav1.ListOptions) (*corev
 	return a.nodes.List(ctx, opts)
 }
 
-func (a *nodeAdapter) Update(ctx context.Context, node *corev1.Node, opts metav1.UpdateOptions) (*corev1.Node, error) {
-	return a.nodes.Update(ctx, node, opts)
+func (a *nodeAdapter) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*corev1.Node, error) {
+	return a.nodes.Patch(ctx, name, pt, data, opts)
+}
+
+// PersistentVolumes implements operations.PersistentVolumeLister.
+func (a *coreV1Adapter) PersistentVolumes() operations.PersistentVolumeInterface {
+	return &persistentVolumeAdapter{pvs: a.coreV1.PersistentVolumes()}
+}
+
+// persistentVolumeAdapter adapts PersistentVolumeInterface
+type persistentVolumeAdapter struct {
+	pvs typedcorev1.PersistentVolumeInterface
+}
+
+func (a *persistentVolumeAdapter) List(ctx context.Context, opts metav1.ListOptions) (*corev1.PersistentVolumeList, error) {
+	return a.pvs.List(ctx, opts)
 }
 
 // namespaceAdapter adapts NamespaceInterface

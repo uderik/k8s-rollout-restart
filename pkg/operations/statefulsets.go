@@ -4,499 +4,498 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/uderik/k8s-rollout-restart/pkg/logger"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// StatefulSetOperations implements StatefulSetOperator interface
+// StatefulSetOperations implements StatefulSetOperator interface.
+//
+// --parallel has the same semantics as for Deployments: at most --parallel
+// StatefulSet rollouts are in progress at any time, globally across
+// namespaces. A worker patches one StatefulSet, waits for it to become ready
+// (bounded per resource by --timeout) and then takes the next one. Any
+// failure stops new launches, with or without --skip-wait.
 type StatefulSetOperations struct {
-	clientset      K8sClient
-	parallel       int
-	timeout        int
-	dryRun         bool
-	log            *logger.Logger
-	minAge         *time.Duration
-	podLabels      []string
-	podAnnotations []string
-	skipWait       bool
+	clientset       K8sClient
+	parallel        int
+	timeout         int
+	dryRun          bool
+	log             *logger.Logger
+	minAge          *time.Duration
+	podLabels       []string
+	podAnnotations  []string
+	containerImages []string
+	skipWait        bool
+	runStop         *RunStop      // run-wide stop signal shared with the other resource types
+	pollInterval    time.Duration // readiness poll interval (defaultPollInterval when zero)
 }
 
-// NewStatefulSetOperations creates a new StatefulSetOperations instance
-func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, _, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, skipWait bool) *StatefulSetOperations {
-	return &StatefulSetOperations{
-		clientset:      clientset,
-		parallel:       parallel,
-		timeout:        timeout,
-		dryRun:         dryRun,
-		log:            logger.NewLogger(dryRun),
-		minAge:         minAge,
-		podLabels:      podLabels,
-		podAnnotations: podAnnotations,
-		skipWait:       skipWait,
+// SetLogger replaces the logger (the configured root logger, so that
+// --output=json applies to every line).
+func (s *StatefulSetOperations) SetLogger(l *logger.Logger) {
+	if l != nil {
+		s.log = l
 	}
 }
 
-// RestartStatefulSets restarts all statefulsets in the given namespaces
+// SetRunStop sets the run-wide stop signal shared by all resource types: a
+// failure here stops launches of the other types and vice versa.
+func (s *StatefulSetOperations) SetRunStop(rs *RunStop) {
+	s.runStop = rs
+}
+
+// NewStatefulSetOperations creates a new StatefulSetOperations instance
+func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, _, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, containerImages []string, skipWait bool) *StatefulSetOperations {
+	return &StatefulSetOperations{
+		clientset:       clientset,
+		parallel:        parallel,
+		timeout:         timeout,
+		dryRun:          dryRun,
+		log:             logger.NewLogger(dryRun),
+		minAge:          minAge,
+		podLabels:       podLabels,
+		podAnnotations:  podAnnotations,
+		containerImages: containerImages,
+		skipWait:        skipWait,
+	}
+}
+
+// hasPodFilters reports whether any pod-level filter (labels, annotations, or
+// container image) is active, based on the parsed (valid) filter values.
+func (s *StatefulSetOperations) hasPodFilters() bool {
+	return len(ParseLabelsOrAnnotations(s.podLabels)) > 0 ||
+		len(ParseLabelsOrAnnotations(s.podAnnotations)) > 0 ||
+		len(nonEmptyStrings(s.containerImages)) > 0
+}
+
+// podMatchesFilters reports whether a pod satisfies all active pod-level filters.
+func (s *StatefulSetOperations) podMatchesFilters(pod *corev1.Pod) bool {
+	return s.podHasRequiredLabels(pod.Labels) &&
+		s.podHasRequiredAnnotations(pod.Annotations) &&
+		PodMatchesAnyImage(pod, s.containerImages)
+}
+
+// podHasRequiredLabels checks if a pod has all the required labels
+func (s *StatefulSetOperations) podHasRequiredLabels(podLabels map[string]string) bool {
+	return MatchesRequirements(podLabels, ParseLabelsOrAnnotations(s.podLabels))
+}
+
+// podHasRequiredAnnotations checks if a pod has all the required annotations
+func (s *StatefulSetOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
+	return MatchesRequirements(podAnnotations, ParseLabelsOrAnnotations(s.podAnnotations))
+}
+
+// statefulSetSelection is the result of selecting StatefulSets in one
+// namespace. It is shared by the dry-run preview and the execute path.
+type statefulSetSelection struct {
+	namespace      string
+	total          int
+	toRestart      []appsv1.StatefulSet
+	postgres       []string
+	elasticsearch  []string
+	tooYoung       []appsv1.StatefulSet
+	noMatchingPods []string
+	unsupported    []string // "name: reason" for update strategies a restart cannot complete under
+}
+
+// selectStatefulSets decides which StatefulSets in a namespace will be restarted.
+func (s *StatefulSetOperations) selectStatefulSets(ctx context.Context, namespace string) (*statefulSetSelection, error) {
+	statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list StatefulSets in namespace %s: %w", namespace, err)
+	}
+
+	sel := &statefulSetSelection{namespace: namespace, total: len(statefulsets.Items)}
+
+	var candidates []appsv1.StatefulSet
+	for _, statefulset := range statefulsets.Items {
+		if isPostgresOperatorStatefulSet(&statefulset) {
+			sel.postgres = append(sel.postgres, statefulset.Name)
+			continue
+		}
+		if isElasticsearchStatefulSet(&statefulset) {
+			sel.elasticsearch = append(sel.elasticsearch, statefulset.Name)
+			continue
+		}
+		if s.minAge != nil && time.Since(statefulset.CreationTimestamp.Time) < *s.minAge {
+			sel.tooYoung = append(sel.tooYoung, statefulset)
+			continue
+		}
+		candidates = append(candidates, statefulset)
+	}
+
+	if s.hasPodFilters() && len(candidates) > 0 {
+		matching, err := s.statefulSetsWithMatchingPods(ctx, namespace)
+		if err != nil {
+			return nil, err
+		}
+		filtered := candidates[:0]
+		for _, sts := range candidates {
+			if !matching[sts.UID] {
+				sel.noMatchingPods = append(sel.noMatchingPods, sts.Name)
+				continue
+			}
+			filtered = append(filtered, sts)
+		}
+		candidates = filtered
+	}
+
+	for _, sts := range candidates {
+		if reason, unsupported := unsupportedUpdateStrategy(&sts); unsupported {
+			sel.unsupported = append(sel.unsupported, fmt.Sprintf("%s: %s", sts.Name, reason))
+			continue
+		}
+		sel.toRestart = append(sel.toRestart, sts)
+	}
+
+	return sel, nil
+}
+
+// unsupportedUpdateStrategy reports whether a template-annotation restart
+// cannot complete under the StatefulSet's update strategy: with OnDelete the
+// controller never replaces pods, and with a RollingUpdate partition > 0 pods
+// with ordinals below the partition keep the old revision.
+func unsupportedUpdateStrategy(sts *appsv1.StatefulSet) (string, bool) {
+	strategy := sts.Spec.UpdateStrategy
+	if strategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		return "updateStrategy is OnDelete, pods would not be replaced automatically", true
+	}
+	if strategy.RollingUpdate != nil && strategy.RollingUpdate.Partition != nil && *strategy.RollingUpdate.Partition > 0 {
+		return fmt.Sprintf("rollingUpdate.partition=%d, pods with lower ordinals would not be restarted",
+			*strategy.RollingUpdate.Partition), true
+	}
+	return "", false
+}
+
+// statefulSetsWithMatchingPods returns the UIDs of StatefulSets that control
+// at least one pod satisfying the active pod filters. Ownership is verified via
+// the pod's controller ownerReference UID, not via label selectors.
+func (s *StatefulSetOperations) statefulSetsWithMatchingPods(ctx context.Context, namespace string) (map[types.UID]bool, error) {
+	pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
+	}
+	result := make(map[types.UID]bool)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !s.podMatchesFilters(pod) {
+			continue
+		}
+		if ref := metav1.GetControllerOf(pod); ref != nil && ref.Kind == "StatefulSet" {
+			result[ref.UID] = true
+		}
+	}
+	return result, nil
+}
+
+// selectAll runs selectStatefulSets for every namespace, with at most
+// s.parallel namespaces in flight. Errors are collected per namespace.
+func (s *StatefulSetOperations) selectAll(ctx context.Context, namespaces []string) ([]*statefulSetSelection, []error) {
+	sels := make([]*statefulSetSelection, len(namespaces))
+	errs := make([]error, len(namespaces))
+	forEachBounded(s.parallel, len(namespaces), func(i int) {
+		if err := ctx.Err(); err != nil {
+			errs[i] = fmt.Errorf("namespace %s: statefulsets not selected: %w", namespaces[i], err)
+			return
+		}
+		sels[i], errs[i] = s.selectStatefulSets(ctx, namespaces[i])
+	})
+
+	var outSels []*statefulSetSelection
+	var outErrs []error
+	for i := range namespaces {
+		if sels[i] != nil {
+			outSels = append(outSels, sels[i])
+		}
+		if errs[i] != nil {
+			outErrs = append(outErrs, errs[i])
+		}
+	}
+	return outSels, outErrs
+}
+
+// logSelection reports what was selected and skipped in a namespace.
+func (s *StatefulSetOperations) logSelection(sel *statefulSetSelection) {
+	ns := sel.namespace
+	s.log.Info("Restarting StatefulSets in namespace: %s", ns)
+	if sel.total == 0 {
+		s.log.Info("No StatefulSets found in namespace: %s", ns)
+		return
+	}
+
+	if len(sel.postgres) > 0 {
+		s.log.Info("Skipping the following StatefulSets in namespace %s (will be restarted via PostgreSQL Operator):", ns)
+		for _, name := range sel.postgres {
+			s.log.Info("- %s (controlled by Zalando PostgreSQL Operator)", name)
+		}
+	}
+	if len(sel.elasticsearch) > 0 {
+		s.log.Info("Skipping the following StatefulSets in namespace %s (managed by the ECK operator, not restarted by this tool):", ns)
+		for _, name := range sel.elasticsearch {
+			s.log.Info("- %s (managed by ECK, skipped)", name)
+		}
+	}
+	for _, sts := range sel.tooYoung {
+		s.log.Info("Skipping StatefulSet %s/%s: too new (age: %s, required: %s)",
+			ns, sts.Name, time.Since(sts.CreationTimestamp.Time).Round(time.Second), *s.minAge)
+	}
+	for _, name := range sel.noMatchingPods {
+		s.log.Info("Skipping StatefulSet %s/%s: no pods matching the requested labels/annotations/image", ns, name)
+	}
+	for _, item := range sel.unsupported {
+		s.log.Warning("Skipping StatefulSet %s/%s: unsupported for restart", ns, item)
+	}
+
+	if len(sel.toRestart) == 0 {
+		s.log.Info("No eligible StatefulSets to restart in namespace: %s", ns)
+		return
+	}
+	s.log.Info("Found %d StatefulSet(s) to restart in namespace: %s", len(sel.toRestart), ns)
+	if s.dryRun {
+		for _, sts := range sel.toRestart {
+			s.log.Info("Would restart StatefulSet: %s/%s", ns, sts.Name)
+		}
+	}
+}
+
+// StatefulSetPlan is the precomputed restart plan of the StatefulSets of a
+// run: the StatefulSets selected in every namespace plus the selection
+// errors. The dry run previews it and the execute path restarts exactly these
+// targets (RestartPlannedStatefulSets).
+type StatefulSetPlan struct {
+	jobs []statefulSetJob
+	errs []error
+}
+
+// statefulSetJob is one planned StatefulSet restart.
+type statefulSetJob struct {
+	namespace string
+	name      string
+}
+
+// Targets returns "namespace/name" of every planned StatefulSet.
+func (p *StatefulSetPlan) Targets() []string {
+	if p == nil {
+		return nil
+	}
+	out := make([]string, 0, len(p.jobs))
+	for _, j := range p.jobs {
+		out = append(out, j.namespace+"/"+j.name)
+	}
+	return out
+}
+
+// Err returns the selection errors of the plan (nil when it is complete).
+func (p *StatefulSetPlan) Err() error {
+	if p == nil {
+		return nil
+	}
+	return errors.Join(p.errs...)
+}
+
+// PlanStatefulSets selects the StatefulSets to restart in every namespace
+// (read-only) and logs the selection. The returned plan is never nil; the
+// error reports selection failures, in which case the plan holds the targets
+// of the other namespaces.
+func (s *StatefulSetOperations) PlanStatefulSets(ctx context.Context, namespaces []string) (*StatefulSetPlan, error) {
+	sels, errs := s.selectAll(ctx, namespaces)
+	for _, err := range errs {
+		s.log.Error("Failed to select StatefulSets: %v", err)
+	}
+	plan := &StatefulSetPlan{errs: errs}
+	for _, sel := range sels {
+		s.logSelection(sel)
+		for _, sts := range sel.toRestart {
+			plan.jobs = append(plan.jobs, statefulSetJob{namespace: sel.namespace, name: sts.Name})
+		}
+	}
+	return plan, plan.Err()
+}
+
+// RestartStatefulSets plans and restarts the StatefulSets of the given
+// namespaces (PlanStatefulSets + RestartPlannedStatefulSets).
 func (s *StatefulSetOperations) RestartStatefulSets(ctx context.Context, namespaces []string) error {
 	if len(namespaces) == 0 {
 		s.log.Info("No namespaces specified, skipping statefulsets restart")
 		return nil
 	}
-
-	// For each namespace, restart statefulsets
-	var wg sync.WaitGroup
-	errorCh := make(chan error, len(namespaces))
-
-	for _, ns := range namespaces {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := s.restartStatefulSetsInNamespace(ctx, ns); err != nil {
-				errorCh <- fmt.Errorf("failed to restart statefulsets in namespace %s: %w", ns, err)
-			}
-		}()
-	}
-
-	wg.Wait()
-	close(errorCh)
-
-	// Check for errors
-	for err := range errorCh {
-		return err // Return first error encountered
-	}
-
-	return nil
+	plan, _ := s.PlanStatefulSets(ctx, namespaces)
+	return s.RestartPlannedStatefulSets(ctx, plan)
 }
 
-// restartStatefulSetsInNamespace restarts all statefulsets in a single namespace
-func (s *StatefulSetOperations) restartStatefulSetsInNamespace(ctx context.Context, namespace string) error {
-	s.log.Info("Restarting StatefulSets in namespace: %s", namespace)
+// RestartPlannedStatefulSets restarts the StatefulSets of a plan. The first
+// restart failure (PATCH rejected or ambiguous, rollout timed out, API error
+// while waiting; with --skip-wait: any failed PATCH) stops launching further
+// rollouts; rollouts in progress are still waited for and the remaining
+// StatefulSets are reported as "not started due to earlier failure". A plan
+// with selection errors trips the run-wide stop before anything is launched,
+// so no StatefulSet is restarted at all. All errors are returned joined.
+func (s *StatefulSetOperations) RestartPlannedStatefulSets(ctx context.Context, plan *StatefulSetPlan) error {
+	if plan == nil {
+		return nil
+	}
+	errs := append([]error(nil), plan.errs...)
+	// A selection error stops the run before anything is launched.
+	rs := tripOnSelectionErrors(s.runStop, errs)
+	jobs := plan.jobs
 
-	statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+	if s.dryRun || len(jobs) == 0 {
+		return errors.Join(errs...)
+	}
+
+	if s.skipWait {
+		s.log.Info("Skipping wait for StatefulSets readiness (--skip-wait flag is set)")
+	}
+
+	// Each worker patches one StatefulSet and waits for its rollout before
+	// taking the next one, so at most s.parallel rollouts are in progress at
+	// any time across all namespaces. After a failure no new rollout is
+	// started (see stopsLaunches).
+	jobErrs, notStarted := runRolloutJobs(s.parallel, len(jobs), rs, func(i int) error {
+		return s.restartOne(ctx, rs, jobs[i].namespace, jobs[i].name)
+	}, func(err error) bool { return stopsLaunches(err) })
+
+	failed := 0
+	for i, err := range jobErrs {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrNotStartedEarlierFailure):
+			errs = append(errs, fmt.Errorf("StatefulSet %s/%s: %w", jobs[i].namespace, jobs[i].name, err))
+		default:
+			failed++
+			errs = append(errs, err)
+		}
+	}
+	if notStarted > 0 {
+		s.log.Error("%d StatefulSet(s) not started due to earlier failure", notStarted)
+	}
+	switch {
+	case failed == 0 && notStarted == 0 && s.skipWait:
+		s.log.Success("Triggered restart of %d StatefulSet(s)", len(jobs))
+	case failed == 0 && notStarted == 0:
+		s.log.Success("All %d restarted StatefulSet(s) are ready", len(jobs))
+	default:
+		s.log.Error("%d of %d StatefulSet restart(s) failed, %d not started", failed, len(jobs), notStarted)
+	}
+
+	return errors.Join(errs...)
+}
+
+// restartOne patches a single StatefulSet and, unless --skip-wait is set,
+// waits (bounded by --timeout) for its rollout to complete. An API error
+// while waiting trips rs at once.
+func (s *StatefulSetOperations) restartOne(ctx context.Context, rs *RunStop, namespace, name string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("StatefulSet %s/%s not restarted: %w", namespace, name, err)
+	}
+	s.log.Info("Restarting StatefulSet: %s/%s", namespace, name)
+	patched, err := s.clientset.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.StrategicMergePatchType, restartPatch(), metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to list StatefulSets in namespace %s: %w", namespace, err)
+		err = &rolloutJobError{
+			err:       fmt.Errorf("failed to trigger rollout for StatefulSet %s/%s: %w", namespace, name, err),
+			ambiguous: patchOutcomeAmbiguous(err),
+		}
+		s.log.Error("%v", err)
+		return err
 	}
-
-	if len(statefulsets.Items) == 0 {
-		s.log.Info("No StatefulSets found in namespace: %s", namespace)
+	s.log.Success("Successfully triggered rollout for StatefulSet: %s/%s", namespace, name)
+	if s.skipWait {
 		return nil
 	}
-
-	// Track which StatefulSets we'll restart and which we'll skip
-	var toRestart []appsv1.StatefulSet
-	var postgresOperatorStatefulSets []string
-	var elasticsearchStatefulSets []string
-
-	// Filter StatefulSets
-	for _, statefulset := range statefulsets.Items {
-		// Skip StatefulSets managed by Zalando PostgreSQL Operator
-		if s.isPostgresOperatorStatefulSet(&statefulset) {
-			postgresOperatorStatefulSets = append(postgresOperatorStatefulSets,
-				fmt.Sprintf("%s (controlled by Zalando PostgreSQL Operator)", statefulset.Name))
-			continue
-		}
-
-		// Skip Elasticsearch StatefulSets
-		if s.isElasticsearchStatefulSet(&statefulset) {
-			elasticsearchStatefulSets = append(elasticsearchStatefulSets,
-				fmt.Sprintf("%s (Elasticsearch cluster)", statefulset.Name))
-			continue
-		}
-
-		// Apply age filter if specified
-		if s.minAge != nil {
-			age := time.Since(statefulset.CreationTimestamp.Time)
-			if age < *s.minAge {
-				s.log.Info("Skipping StatefulSet %s/%s: too new (age: %s, required: %s)",
-					namespace, statefulset.Name, age.Round(time.Second), *s.minAge)
-				continue
-			}
-		}
-
-		// Check if StatefulSet has pods with required labels or annotations
-		if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
-			sts := statefulset
-			hasMatchingPods, err := s.hasPodsWithLabelsOrAnnotations(ctx, namespace, &sts)
-			if err != nil {
-				s.log.Warning("Failed to check pods for StatefulSet %s: %v", statefulset.Name, err)
-				continue
-			}
-			if !hasMatchingPods {
-				s.log.Info("Skipping StatefulSet %s: no pods with required labels or annotations", statefulset.Name)
-				continue
-			}
-		}
-
-		toRestart = append(toRestart, statefulset)
-	}
-
-	// Log the skipped PostgreSQL Operator StatefulSets
-	if len(postgresOperatorStatefulSets) > 0 {
-		s.log.Info("Skipping the following StatefulSets in namespace %s (will be restarted via PostgreSQL Operator):", namespace)
-		for _, name := range postgresOperatorStatefulSets {
-			s.log.Info("- %s", name)
-		}
-	}
-
-	// Log the skipped Elasticsearch StatefulSets
-	if len(elasticsearchStatefulSets) > 0 {
-		s.log.Info("Skipping the following Elasticsearch StatefulSets in namespace %s:", namespace)
-		for _, name := range elasticsearchStatefulSets {
-			s.log.Info("- %s", name)
-		}
-	}
-
-	// If no StatefulSets to restart after filtering
-	if len(toRestart) == 0 {
-		s.log.Info("No eligible StatefulSets to restart in namespace: %s", namespace)
-		return nil
-	}
-
-	s.log.Info("Found %d StatefulSet(s) to restart in namespace: %s", len(toRestart), namespace)
-
-	if s.dryRun {
-		for _, statefulset := range toRestart {
-			s.log.Info("Would restart StatefulSet: %s/%s", namespace, statefulset.Name)
-		}
-		return nil
-	}
-
-	// Process each StatefulSet that passed the filters. A failure to patch one
-	// StatefulSet must not prevent the remaining ones from being restarted, so
-	// we accumulate errors and continue, mirroring the Deployments path.
-	var restartErrs []error
-	restartedNames := make([]string, 0, len(toRestart))
-	for _, statefulset := range toRestart {
-		s.log.Info("Restarting StatefulSet: %s/%s", namespace, statefulset.Name)
-
-		if err := s.triggerStatefulSetRollout(ctx, namespace, statefulset.Name); err != nil {
-			s.log.Warning("Failed to trigger rollout for StatefulSet %s/%s: %v", namespace, statefulset.Name, err)
-			restartErrs = append(restartErrs, fmt.Errorf("failed to trigger rollout for StatefulSet %s/%s: %w", namespace, statefulset.Name, err))
-			continue
-		}
-
-		restartedNames = append(restartedNames, statefulset.Name)
-		s.log.Success("Successfully triggered rollout for StatefulSet: %s/%s", namespace, statefulset.Name)
-	}
-
-	// Wait only for the StatefulSets that were actually restarted.
-	if len(restartedNames) > 0 {
-		if !s.skipWait {
-			s.log.Info("Waiting for all StatefulSets to be ready in namespace: %s", namespace)
-			if err := s.waitForStatefulSetsReady(ctx, namespace, restartedNames); err != nil {
-				restartErrs = append(restartErrs, fmt.Errorf("failed to wait for StatefulSets to be ready: %w", err))
-			} else {
-				s.log.Success("All StatefulSets are ready in namespace: %s", namespace)
-			}
-		} else {
-			s.log.Info("Skipping wait for StatefulSets readiness (--skip-wait flag is set)")
-		}
-	}
-
-	return errors.Join(restartErrs...)
-}
-
-// waitForStatefulSetsReady waits for all specified statefulsets to be ready after restart
-func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, namespace string, statefulsetNames []string) error {
-	if len(statefulsetNames) == 0 {
-		return nil
-	}
-
-	// Create a map of statefulset names for quick lookup with their initial generation
-	statefulsetGenerations := make(map[string]int64)
-	for _, name := range statefulsetNames {
-		sts, err := s.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get StatefulSet %s: %w", name, err)
-		}
-		statefulsetGenerations[name] = sts.Generation
-	}
-
-	// Wait for statefulsets to be ready
-	s.log.Info("Waiting for %d statefulset(s) in namespace %s to become ready", len(statefulsetNames), namespace)
-
-	// Create a timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(s.timeout)*time.Second)
-	defer cancel()
-
-	// Check every 5 seconds
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timeout waiting for statefulsets to be ready in namespace %s", namespace)
-		case <-ticker.C:
-			// Get current state of statefulsets
-			statefulSetsReady := 0
-			totalStatefulSets := len(statefulsetGenerations)
-			notReadyStatefulSets := []string{}
-
-			// Check each statefulset
-			for statefulsetName := range statefulsetGenerations {
-				statefulset, err := s.clientset.AppsV1().StatefulSets(namespace).Get(ctx, statefulsetName, metav1.GetOptions{})
-				if err != nil {
-					s.log.Warning("Failed to get statefulset %s/%s: %v", namespace, statefulsetName, err)
-					notReadyStatefulSets = append(notReadyStatefulSets, statefulsetName)
-					continue
-				}
-
-				// Check if statefulset generation increased and all conditions are satisfied
-				isReady := true
-
-				// Check if generation was observed
-				if statefulset.Status.ObservedGeneration < statefulset.Generation {
-					isReady = false
-				}
-
-				// Determine the desired replica count. Status.Replicas is the
-				// observed number of pods (which transiently drops below the
-				// desired count mid-rollout as the controller recreates pods),
-				// so comparing against it can report readiness prematurely.
-				desired := int32(1)
-				if statefulset.Spec.Replicas != nil {
-					desired = *statefulset.Spec.Replicas
-				}
-
-				// All desired replicas must be updated and ready, and the
-				// rollout must have fully converged onto the new revision.
-				if statefulset.Status.UpdatedReplicas != desired ||
-					statefulset.Status.ReadyReplicas != desired ||
-					statefulset.Status.CurrentRevision != statefulset.Status.UpdateRevision {
-					isReady = false
-				}
-
-				if isReady {
-					statefulSetsReady++
-				} else {
-					notReadyStatefulSets = append(notReadyStatefulSets, statefulsetName)
-				}
-			}
-
-			// Log progress
-			if statefulSetsReady == totalStatefulSets {
-				s.log.Success("All statefulsets are ready in namespace %s", namespace)
-				return nil
-			}
-
-			s.log.Info("Waiting for statefulsets to be ready in namespace %s (%d/%d ready)",
-				namespace, statefulSetsReady, totalStatefulSets)
-
-			if len(notReadyStatefulSets) > 0 && len(notReadyStatefulSets) <= 5 {
-				s.log.Info("StatefulSets not yet ready: %s", strings.Join(notReadyStatefulSets, ", "))
-			}
-		}
-	}
-}
-
-// isPostgresOperatorStatefulSet checks if the statefulset is managed by Zalando PostgreSQL Operator
-func (s *StatefulSetOperations) isPostgresOperatorStatefulSet(statefulset *appsv1.StatefulSet) bool {
-	// Check for Zalando PostgreSQL Operator labels
-	if value, exists := statefulset.Labels["application"]; exists && value == "spilo" {
-		return true
-	}
-
-	// Check for Zalando PostgreSQL Operator cluster-name label
-	if _, exists := statefulset.Labels["cluster-name"]; exists {
-		return true
-	}
-
-	// Check for Zalando PostgreSQL Operator team label
-	if _, exists := statefulset.Labels["team"]; exists {
-		if _, exists := statefulset.Labels["cluster-name"]; exists {
-			return true
-		}
-	}
-
-	// Check for Zalando PostgreSQL Operator version label
-	if _, exists := statefulset.Labels["version"]; exists {
-		if _, exists := statefulset.Labels["cluster-name"]; exists {
-			return true
-		}
-	}
-
-	return false
-}
-
-// isElasticsearchStatefulSet checks if the statefulset is part of an Elasticsearch cluster
-func (s *StatefulSetOperations) isElasticsearchStatefulSet(statefulset *appsv1.StatefulSet) bool {
-	// Check for Elastic Cloud on Kubernetes (ECK) operator labels
-	if value, exists := statefulset.Labels["common.k8s.elastic.co/type"]; exists && value == "elasticsearch" {
-		return true
-	}
-
-	// Check for ECK cluster-name label
-	if _, exists := statefulset.Labels["elasticsearch.k8s.elastic.co/cluster-name"]; exists {
-		return true
-	}
-
-	// Check if StatefulSet name contains "elasticsearch"
-	if strings.Contains(strings.ToLower(statefulset.Name), "elasticsearch") {
-		return true
-	}
-
-	// Check for app label with elasticsearch value
-	if value, exists := statefulset.Labels["app"]; exists {
-		if strings.Contains(strings.ToLower(value), "elasticsearch") {
-			return true
-		}
-	}
-
-	return false
-}
-
-// triggerStatefulSetRollout triggers a rollout for a StatefulSet by adding a restart annotation
-func (s *StatefulSetOperations) triggerStatefulSetRollout(ctx context.Context, namespace, name string) error {
-	// Patch statefulset to trigger a rolling update
-	patchData := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`, time.Now().Format(time.RFC3339))
-	_, err := s.clientset.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to patch StatefulSet %s/%s: %w", namespace, name, err)
+	target := rolloutTarget{namespace: namespace, name: name, minGeneration: patched.Generation}
+	if err := s.waitForStatefulSetsReady(ctx, []rolloutTarget{target}, rs.Trip); err != nil {
+		return fmt.Errorf("StatefulSet %s/%s did not become ready: %w", namespace, name, err)
 	}
 	return nil
 }
 
-// hasPodsWithLabelsOrAnnotations checks if a StatefulSet has pods with the required labels or annotations
-func (s *StatefulSetOperations) hasPodsWithLabelsOrAnnotations(ctx context.Context, namespace string, statefulset *appsv1.StatefulSet) (bool, error) {
-	var pods *corev1.PodList
-
-	// Primary: select pods using the StatefulSet's own pod selector. Guessing
-	// conventional labels like "app=<name>" is unreliable and can match
-	// unrelated pods, so derive the selector from the spec.
-	if statefulset.Spec.Selector != nil {
-		selector := metav1.FormatLabelSelector(statefulset.Spec.Selector)
-		list, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: selector,
-		})
+// waitForStatefulSetsReady waits for the restarted statefulsets to finish
+// their rollout. Every API call uses the bounded timeout context.
+func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, targets []rolloutTarget, trip func(error)) error {
+	check := func(ctx context.Context, t rolloutTarget) (bool, string, error, error) {
+		sts, err := s.clientset.AppsV1().StatefulSets(t.namespace).Get(ctx, t.name, metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Errorf("failed to list pods for StatefulSet %s: %w", statefulset.Name, err)
-		}
-		pods = list
-	}
-
-	// Fallback: match by owner reference (covers StatefulSets without a usable
-	// label selector).
-	if pods == nil || len(pods.Items) == 0 {
-		allPods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return false, fmt.Errorf("failed to list all pods in namespace %s: %w", namespace, err)
-		}
-
-		owned := &corev1.PodList{}
-		for _, pod := range allPods.Items {
-			for _, owner := range pod.OwnerReferences {
-				if owner.Kind == "StatefulSet" && owner.Name == statefulset.Name {
-					owned.Items = append(owned.Items, pod)
-				}
+			if apierrors.IsNotFound(err) && ctx.Err() == nil {
+				return false, "", fmt.Errorf("StatefulSet no longer exists: %w", err), nil
 			}
+			return false, "", nil, err
 		}
-		pods = owned
+		done, reason := statefulSetRolloutStatus(sts, t.minGeneration)
+		return done, reason, nil, nil
+	}
+	return waitForRollouts(ctx, s.log, "StatefulSet", time.Duration(s.timeout)*time.Second, s.pollInterval, targets, check, trip)
+}
+
+// statefulSetRolloutStatus reports whether a StatefulSet has completed its
+// rollout. minGeneration is the generation returned by the restart PATCH.
+func statefulSetRolloutStatus(sts *appsv1.StatefulSet, minGeneration int64) (bool, string) {
+	generation := sts.Generation
+	if minGeneration > generation {
+		generation = minGeneration
+	}
+	st := sts.Status
+	if st.ObservedGeneration < generation {
+		return false, fmt.Sprintf("generation not observed yet (observed: %d, expected: %d)", st.ObservedGeneration, generation)
 	}
 
-	// Check if any pod has the required labels or annotations
-	for _, pod := range pods.Items {
-		if s.podHasRequiredLabels(pod.Labels) && s.podHasRequiredAnnotations(pod.Annotations) {
-			return true, nil
-		}
+	// Status.Replicas transiently drops below the desired count mid-rollout
+	// as the controller recreates pods, so compare against the spec.
+	desired := int32(1)
+	if sts.Spec.Replicas != nil {
+		desired = *sts.Spec.Replicas
 	}
 
-	return false, nil
+	switch {
+	case st.UpdatedReplicas != desired:
+		return false, fmt.Sprintf("pods updating (%d/%d updated)", st.UpdatedReplicas, desired)
+	case st.Replicas != desired:
+		return false, fmt.Sprintf("replica count converging (%d/%d)", st.Replicas, desired)
+	case st.ReadyReplicas != desired:
+		return false, fmt.Sprintf("pods starting (%d/%d ready)", st.ReadyReplicas, desired)
+	case st.AvailableReplicas != desired:
+		return false, fmt.Sprintf("pods becoming available (%d/%d available)", st.AvailableReplicas, desired)
+	case st.CurrentRevision != st.UpdateRevision:
+		return false, fmt.Sprintf("revision not converged (current: %s, update: %s)", st.CurrentRevision, st.UpdateRevision)
+	}
+	return true, ""
 }
 
-// podHasRequiredLabels checks if a pod has all the required labels
-func (s *StatefulSetOperations) podHasRequiredLabels(podLabels map[string]string) bool {
-	requiredLabels := ParseLabelsOrAnnotations(s.podLabels)
-	return MatchesRequirements(podLabels, requiredLabels)
+// isPostgresOperatorStatefulSet reports whether the statefulset is managed by
+// the Zalando PostgreSQL Operator: it is owned by a "postgresql" resource or
+// carries the Spilo application label set by the operator.
+func isPostgresOperatorStatefulSet(statefulset *appsv1.StatefulSet) bool {
+	for _, ref := range statefulset.OwnerReferences {
+		if ref.Kind == "postgresql" {
+			return true
+		}
+	}
+	return statefulset.Labels["application"] == "spilo"
 }
 
-// podHasRequiredAnnotations checks if a pod has all the required annotations
-func (s *StatefulSetOperations) podHasRequiredAnnotations(podAnnotations map[string]string) bool {
-	requiredAnnotations := ParseLabelsOrAnnotations(s.podAnnotations)
-	return MatchesRequirements(podAnnotations, requiredAnnotations)
+// isElasticsearchStatefulSet reports whether the statefulset belongs to an
+// ECK-managed Elasticsearch cluster: it carries the ECK type label or is owned
+// by an Elasticsearch resource.
+func isElasticsearchStatefulSet(statefulset *appsv1.StatefulSet) bool {
+	if statefulset.Labels["common.k8s.elastic.co/type"] == "elasticsearch" {
+		return true
+	}
+	for _, ref := range statefulset.OwnerReferences {
+		if ref.Kind == "Elasticsearch" {
+			return true
+		}
+	}
+	return false
 }
 
-// GetStatefulSetsToRestart returns a list of statefulsets that would be restarted
+// GetStatefulSetsToRestart returns "namespace/name" of every StatefulSet
+// that would be restarted (PlanStatefulSets).
 func (s *StatefulSetOperations) GetStatefulSetsToRestart(ctx context.Context, namespaces []string) ([]string, error) {
-	var allStatefulSets []string
-
-	for _, namespace := range namespaces {
-		statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to list StatefulSets in namespace %s: %w", namespace, err)
-		}
-
-		// Get all pods in the namespace once for efficient filtering
-		var podsWithMatchingLabels []string
-		if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
-			allPods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, fmt.Errorf("failed to list pods in namespace %s: %w", namespace, err)
-			}
-
-			// Create a map of statefulset names that have matching pods
-			statefulSetPods := make(map[string]bool)
-			for _, pod := range allPods.Items {
-				// Check if pod has required labels and annotations
-				if s.podHasRequiredLabels(pod.Labels) && s.podHasRequiredAnnotations(pod.Annotations) {
-					// Find which statefulset this pod belongs to
-					for _, owner := range pod.OwnerReferences {
-						if owner.Kind == "StatefulSet" {
-							statefulSetPods[owner.Name] = true
-						}
-					}
-				}
-			}
-			podsWithMatchingLabels = make([]string, 0, len(statefulSetPods))
-			for statefulSetName := range statefulSetPods {
-				podsWithMatchingLabels = append(podsWithMatchingLabels, statefulSetName)
-			}
-		}
-
-		// Apply the same filtering logic as in RestartStatefulSets
-		for _, statefulset := range statefulsets.Items {
-			// Skip StatefulSets managed by Zalando PostgreSQL Operator
-			if s.isPostgresOperatorStatefulSet(&statefulset) {
-				continue
-			}
-
-			// Skip Elasticsearch StatefulSets
-			if s.isElasticsearchStatefulSet(&statefulset) {
-				continue
-			}
-
-			// Apply age filter if specified
-			if s.minAge != nil {
-				age := time.Since(statefulset.CreationTimestamp.Time)
-				if age < *s.minAge {
-					continue
-				}
-			}
-
-			// Check if StatefulSet has pods with required labels or annotations
-			if len(s.podLabels) > 0 || len(s.podAnnotations) > 0 {
-				hasMatchingPods := false
-				for _, statefulSetName := range podsWithMatchingLabels {
-					if statefulSetName == statefulset.Name {
-						hasMatchingPods = true
-						break
-					}
-				}
-				if !hasMatchingPods {
-					continue
-				}
-			}
-
-			allStatefulSets = append(allStatefulSets, fmt.Sprintf("%s/%s", namespace, statefulset.Name))
-		}
-	}
-
-	return allStatefulSets, nil
+	plan, err := s.PlanStatefulSets(ctx, namespaces)
+	return plan.Targets(), err
 }
