@@ -117,14 +117,6 @@ func readyDeployment(ns, name string, age time.Duration) *appsv1.Deployment {
 	}
 }
 
-func withCanaryOwner(d *appsv1.Deployment) *appsv1.Deployment {
-	d.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "flagger.app/v1beta1", Kind: "Canary", Name: strings.TrimSuffix(d.Name, "-primary"),
-		UID: "canary-uid", Controller: boolPtr(true),
-	}}
-	return d
-}
-
 func replicaSetFor(d *appsv1.Deployment, name string) *appsv1.ReplicaSet {
 	return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace: d.Namespace, Name: name, UID: types.UID("uid-rs-" + name),
@@ -153,6 +145,7 @@ func newTestDeploymentOps(client K8sClient, opts func(d *DeploymentOperations)) 
 		timeout:      5,
 		log:          logger.NewLogger(false),
 		pollInterval: 10 * time.Millisecond,
+		podHealth:    DefaultPodHealthPolicy(),
 	}
 	if opts != nil {
 		opts(d)
@@ -316,23 +309,28 @@ func TestRestartDeployments_SkipsPaused(t *testing.T) {
 	}
 }
 
-// flaggerScenario builds a namespace exercising the Flagger, age, paused and
-// pod-ownership selection rules.
-func flaggerScenario() []runtime.Object {
+// scaledToZero returns d with spec.replicas = 0 and no pods.
+func scaledToZero(d *appsv1.Deployment) *appsv1.Deployment {
+	d.Spec.Replicas = int32Ptr(0)
+	d.Status = appsv1.DeploymentStatus{ObservedGeneration: d.Generation}
+	return d
+}
+
+// selectionScenario builds a namespace exercising the replica, age and paused
+// selection rules.
+func selectionScenario() []runtime.Object {
 	ns := "ns"
-	// Flagger pair whose primary is too young: neither must be restarted.
-	web := readyDeployment(ns, "web", time.Hour)
-	webPrimary := withCanaryOwner(readyDeployment(ns, "web-primary", time.Second))
-	// Flagger pair with old primary: only the primary is restarted.
+	// Old enough, with pods: restarted.
 	app := readyDeployment(ns, "app", time.Hour)
-	appPrimary := withCanaryOwner(readyDeployment(ns, "app-primary", time.Hour))
-	// "-primary" without a Canary owner: both are ordinary deployments.
 	api := readyDeployment(ns, "api", time.Hour)
-	apiPrimary := readyDeployment(ns, "api-primary", time.Hour)
+	// Too young.
+	young := readyDeployment(ns, "young", time.Second)
+	// Scaled to zero.
+	idle := scaledToZero(readyDeployment(ns, "idle", time.Hour))
 	// Paused deployment.
 	paused := readyDeployment(ns, "paused", time.Hour)
 	paused.Spec.Paused = true
-	return []runtime.Object{web, webPrimary, app, appPrimary, api, apiPrimary, paused}
+	return []runtime.Object{app, api, young, idle, paused}
 }
 
 func TestDeploymentSelectionParity(t *testing.T) {
@@ -340,20 +338,13 @@ func TestDeploymentSelectionParity(t *testing.T) {
 	tests := []struct {
 		name      string
 		objects   []runtime.Object
-		noFlagger bool
 		podLabels []string
 		want      []string
 	}{
 		{
-			name:    "flagger relationships built before min-age filter",
-			objects: flaggerScenario(),
-			want:    []string{"ns/api", "ns/api-primary", "ns/app-primary"},
-		},
-		{
-			name:      "no flagger filter restarts all old enough deployments",
-			objects:   flaggerScenario(),
-			noFlagger: true,
-			want:      []string{"ns/api", "ns/api-primary", "ns/app", "ns/app-primary", "ns/web"},
+			name:    "deployments with pods are restarted, scaled to zero, young and paused are skipped",
+			objects: selectionScenario(),
+			want:    []string{"ns/api", "ns/app"},
 		},
 		{
 			name: "pod filter verifies controller chain",
@@ -375,7 +366,6 @@ func TestDeploymentSelectionParity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := func(d *DeploymentOperations) {
 				d.minAge = &minAge
-				d.noFlagger = tt.noFlagger
 				d.podLabels = tt.podLabels
 			}
 

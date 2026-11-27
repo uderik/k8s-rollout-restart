@@ -66,10 +66,10 @@ func TestRunMaintenance_LaterResourceTypesReportedNotStarted(t *testing.T) {
 	c := stopTestClient{stsPatched: &patched}
 	log := logger.NewLogger(false)
 	rs := operations.NewRunStop()
-	deploymentOps := operations.NewDeploymentOperations(c, 1, 1, true, false, nil, nil, nil, nil, false)
+	deploymentOps := operations.NewDeploymentOperations(c, 1, 1, false, nil, nil, nil, nil, false)
 	deploymentOps.SetLogger(log)
 	deploymentOps.SetRunStop(rs)
-	statefulSetOps := operations.NewStatefulSetOperations(c, 1, 1, true, false, nil, nil, nil, nil, false)
+	statefulSetOps := operations.NewStatefulSetOperations(c, 1, 1, false, nil, nil, nil, nil, false)
 	statefulSetOps.SetLogger(log)
 	statefulSetOps.SetRunStop(rs)
 	ops := maintenanceOps{deployment: deploymentOps, statefulSet: statefulSetOps}

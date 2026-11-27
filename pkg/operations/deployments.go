@@ -30,7 +30,6 @@ type DeploymentOperations struct {
 	parallel             int
 	timeout              int
 	dryRun               bool
-	noFlagger            bool
 	log                  *logger.Logger
 	minAge               *time.Duration
 	podLabels            []string
@@ -39,8 +38,9 @@ type DeploymentOperations struct {
 	parsedPodLabels      map[string]string // cached parsed pod labels
 	parsedPodAnnotations map[string]string // cached parsed pod annotations
 	skipWait             bool
-	runStop              *RunStop      // run-wide stop signal shared with the other resource types
-	pollInterval         time.Duration // readiness poll interval (defaultPollInterval when zero)
+	runStop              *RunStop        // run-wide stop signal shared with the other resource types
+	pollInterval         time.Duration   // readiness poll interval (defaultPollInterval when zero)
+	podHealth            PodHealthPolicy // when a new-revision pod fails the rollout wait at once
 }
 
 // SetLogger replaces the logger (the configured root logger, so that
@@ -57,8 +57,14 @@ func (d *DeploymentOperations) SetRunStop(rs *RunStop) {
 	d.runStop = rs
 }
 
+// SetPodHealthPolicy sets when a pod of the new revision is broken and fails
+// the rollout wait at once (DefaultPodHealthPolicy unless set).
+func (d *DeploymentOperations) SetPodHealthPolicy(p PodHealthPolicy) {
+	d.podHealth = p
+}
+
 // NewDeploymentOperations creates a new DeploymentOperations instance
-func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagger, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, containerImages []string, skipWait bool) *DeploymentOperations {
+func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, containerImages []string, skipWait bool) *DeploymentOperations {
 	log := logger.NewLogger(dryRun)
 	parsedLabels, err := ParseLabelsOrAnnotationsStrict(podLabels)
 	if err != nil {
@@ -73,7 +79,6 @@ func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagg
 		parallel:             parallel,
 		timeout:              timeout,
 		dryRun:               dryRun,
-		noFlagger:            noFlagger,
 		log:                  log,
 		minAge:               minAge,
 		podLabels:            podLabels,
@@ -82,6 +87,7 @@ func NewDeploymentOperations(clientset K8sClient, parallel, timeout int, noFlagg
 		parsedPodLabels:      parsedLabels,
 		parsedPodAnnotations: parsedAnnotations,
 		skipWait:             skipWait,
+		podHealth:            DefaultPodHealthPolicy(),
 	}
 }
 
@@ -131,7 +137,6 @@ func (d *DeploymentOperations) podHasRequiredAnnotations(podAnnotations map[stri
 // deploymentCandidate is a Deployment selected for restart.
 type deploymentCandidate struct {
 	deployment appsv1.Deployment
-	reason     string
 }
 
 // deploymentSelection is the result of selecting Deployments in one namespace.
@@ -141,21 +146,15 @@ type deploymentSelection struct {
 	namespace      string
 	total          int
 	toRestart      []deploymentCandidate
-	hasPrimary     []string // Flagger targets skipped because their primary is managed by Flagger
+	scaledToZero   []string // spec.replicas == 0: no pods to restart
 	tooYoung       []appsv1.Deployment
 	noMatchingPods []string
 	paused         []string
 }
 
-// isFlaggerPrimary reports whether the deployment is a Flagger-managed primary.
-func (d *DeploymentOperations) isFlaggerPrimary(deployment appsv1.Deployment) bool {
-	return strings.HasSuffix(deployment.Name, "-primary") && d.hasFlaggerCanaryOwner(deployment)
-}
-
 // selectDeployments decides which Deployments in a namespace will be
-// restarted. The Flagger primary/target relationship is built from the full
-// Deployment list before any filter is applied, so filtering out a primary
-// (e.g. by --min-age) never causes its canary target to be restarted instead.
+// restarted. A Deployment scaled to zero (spec.replicas == 0) has no pods and
+// is skipped: patching its template would restart nothing.
 func (d *DeploymentOperations) selectDeployments(ctx context.Context, namespace string) (*deploymentSelection, error) {
 	deployments, err := d.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -164,25 +163,11 @@ func (d *DeploymentOperations) selectDeployments(ctx context.Context, namespace 
 
 	sel := &deploymentSelection{namespace: namespace, total: len(deployments.Items)}
 
-	flaggerPrimaries := make(map[string]bool)
-	if !d.noFlagger {
-		for _, deployment := range deployments.Items {
-			if d.isFlaggerPrimary(deployment) {
-				flaggerPrimaries[deployment.Name] = true
-			}
-		}
-	}
-
-	// Flagger classification and cheap filters first.
+	// Cheap filters first.
 	var candidates []deploymentCandidate
 	for _, deployment := range deployments.Items {
-		reason := "(no primary counterpart)"
-		if d.noFlagger {
-			reason = "(Flagger filter disabled)"
-		} else if flaggerPrimaries[deployment.Name] {
-			reason = "(Flagger primary deployment)"
-		} else if flaggerPrimaries[deployment.Name+"-primary"] {
-			sel.hasPrimary = append(sel.hasPrimary, deployment.Name)
+		if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
+			sel.scaledToZero = append(sel.scaledToZero, deployment.Name)
 			continue
 		}
 
@@ -191,7 +176,7 @@ func (d *DeploymentOperations) selectDeployments(ctx context.Context, namespace 
 			continue
 		}
 
-		candidates = append(candidates, deploymentCandidate{deployment: deployment, reason: reason})
+		candidates = append(candidates, deploymentCandidate{deployment: deployment})
 	}
 
 	// Pod-level filters, using controller ownership rather than selectors.
@@ -301,8 +286,8 @@ func (d *DeploymentOperations) logSelection(sel *deploymentSelection) {
 	}
 	d.log.Info("Found %d deployment(s) in namespace %s", sel.total, ns)
 
-	for _, name := range sel.hasPrimary {
-		d.log.Info("Skipping deployment %s/%s: has a Flagger primary counterpart", ns, name)
+	for _, name := range sel.scaledToZero {
+		d.log.Info("Skipping deployment %s/%s: scaled to zero (no pods)", ns, name)
 	}
 	for _, deployment := range sel.tooYoung {
 		d.log.Info("Skipping deployment %s/%s: too new (age: %s, required: %s)", ns, deployment.Name,
@@ -326,7 +311,7 @@ func (d *DeploymentOperations) logSelection(sel *deploymentSelection) {
 	d.log.Info("%s %d/%d deployment(s) in namespace %s", verb, len(sel.toRestart), sel.total, ns)
 	if d.dryRun {
 		for _, c := range sel.toRestart {
-			d.log.Info("- %s %s", c.deployment.Name, c.reason)
+			d.log.Info("- %s", c.deployment.Name)
 		}
 	}
 }
@@ -464,7 +449,7 @@ func (d *DeploymentOperations) restartOne(ctx context.Context, rs *RunStop, name
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("deployment %s/%s not restarted: %w", namespace, name, err)
 	}
-	d.log.Info("Restarting deployment %s/%s %s", namespace, name, c.reason)
+	d.log.Info("Restarting deployment %s/%s", namespace, name)
 	patched, err := d.clientset.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType, restartPatch(), metav1.PatchOptions{})
 	if err != nil {
 		err = &rolloutJobError{
@@ -486,7 +471,10 @@ func (d *DeploymentOperations) restartOne(ctx context.Context, rs *RunStop, name
 }
 
 // waitForDeploymentsReady waits for the restarted deployments to finish their
-// rollout. Every API call uses the bounded timeout context.
+// rollout. Every API call uses the bounded timeout context. While a rollout
+// is in progress, the pods of the new revision are checked as well: a pod
+// that cannot become ready on its own (PodHealthPolicy) fails the rollout at
+// once instead of waiting for --timeout.
 func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, targets []rolloutTarget, trip func(error)) error {
 	check := func(ctx context.Context, t rolloutTarget) (bool, string, error, error) {
 		deployment, err := d.clientset.AppsV1().Deployments(t.namespace).Get(ctx, t.name, metav1.GetOptions{})
@@ -497,9 +485,49 @@ func (d *DeploymentOperations) waitForDeploymentsReady(ctx context.Context, targ
 			return false, "", nil, err
 		}
 		done, reason, terminal := deploymentRolloutStatus(deployment, t.minGeneration)
-		return done, reason, terminal, nil
+		if done || terminal != nil || !d.podHealth.enabled() ||
+			deployment.Status.ObservedGeneration < max(deployment.Generation, t.minGeneration) {
+			return done, reason, terminal, nil
+		}
+		broken, fetchErr := d.brokenNewRevisionPods(ctx, t.namespace, deployment)
+		return false, reason, broken, fetchErr
 	}
 	return waitForRollouts(ctx, d.log, "deployment", time.Duration(d.timeout)*time.Second, d.pollInterval, targets, check, trip)
+}
+
+// deploymentRevisionAnnotation is set by the Deployment controller on a
+// Deployment and its ReplicaSets; the ReplicaSet with the Deployment's
+// revision is the new one.
+const deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
+
+// brokenNewRevisionPods returns a terminal error if a pod of the Deployment's
+// new ReplicaSet cannot become ready on its own. Pods of older ReplicaSets
+// are ignored: they are being replaced. It must only be called once the
+// controller has observed the restart, so that the Deployment's revision
+// annotation refers to the new ReplicaSet.
+func (d *DeploymentOperations) brokenNewRevisionPods(ctx context.Context, namespace string, deployment *appsv1.Deployment) (terminal, fetchErr error) {
+	revision := deployment.Annotations[deploymentRevisionAnnotation]
+	if revision == "" || deployment.Spec.Selector == nil {
+		return nil, nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return nil, nil
+	}
+	replicaSets, err := d.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list replicasets: %w", err)
+	}
+	for i := range replicaSets.Items {
+		rs := &replicaSets.Items[i]
+		if !controlledBy(rs, deployment.UID) || rs.Annotations[deploymentRevisionAnnotation] != revision {
+			continue
+		}
+		return d.podHealth.brokenPodsErr(ctx, d.clientset, namespace, selector.String(), func(pod *corev1.Pod) bool {
+			return controlledBy(pod, rs.UID)
+		})
+	}
+	return nil, nil
 }
 
 // deploymentRolloutStatus reports whether a Deployment has completed its
@@ -552,18 +580,6 @@ func deploymentRolloutStatus(deployment *appsv1.Deployment, minGeneration int64)
 		return true, "", nil
 	}
 	return false, strings.Join(notes, ", "), nil
-}
-
-// hasFlaggerCanaryOwner checks if the deployment has a Flagger Canary owner reference
-func (d *DeploymentOperations) hasFlaggerCanaryOwner(deployment appsv1.Deployment) bool {
-	for _, ownerRef := range deployment.OwnerReferences {
-		if ownerRef.APIVersion == "flagger.app/v1beta1" &&
-			ownerRef.Kind == "Canary" &&
-			ownerRef.Controller != nil && *ownerRef.Controller {
-			return true
-		}
-	}
-	return false
 }
 
 // GetDeploymentsToRestart returns "namespace/name" of every Deployment that

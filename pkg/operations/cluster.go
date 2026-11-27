@@ -58,7 +58,7 @@ type ClusterOperations struct {
 }
 
 // NewClusterOperations creates a new ClusterOperations instance
-func NewClusterOperations(clientset K8sClient, parallel, timeout int, _, dryRun bool) *ClusterOperations {
+func NewClusterOperations(clientset K8sClient, parallel, timeout int, dryRun bool) *ClusterOperations {
 	return &ClusterOperations{
 		clientset: clientset,
 		parallel:  parallel,

@@ -209,12 +209,13 @@ k8s-rollout-restart --version
 | `--pod-labels` | Only restart resources that have a pod with all these labels (`key=value`, comma-separated) |
 | `--pod-annotations` | Only restart resources that have a pod with all these annotations (`key=value`, comma-separated) |
 | `--container-image` | Only restart resources that have a pod running a container whose image contains one of these substrings (comma-separated, OR) |
-| `--no-flagger-filter` | Disable the Flagger filter (restart all deployments, not just Flagger primaries) |
 | `--cordon` | Cordon nodes before the restart. Nodes are **not** uncordoned afterwards (see [Node Cordoning](#node-cordoning)) |
 | `--cordon-all-nodes` | Cordon all nodes in the cluster, not just those with pods from the target namespaces |
 | `--node-labels` | Only cordon nodes with these labels (`key=value`, comma-separated) |
 | `--exclude-node-labels` | Never cordon nodes with these labels (`key=value`, comma-separated; default `[eks.amazonaws.com/compute-type=fargate]`) |
 | `--skip-wait` | Do not wait for pods to become ready after restart |
+| `--crashloop-restarts` | Fail a Deployment/StatefulSet rollout at once when a pod of the new revision is in `CrashLoopBackOff` with at least this many restarts (default 3, must be >= 0; `0` disables the check). See [Broken pods](#broken-pods) |
+| `--fail-fast-reasons` | Container waiting reasons that fail a Deployment/StatefulSet rollout at once, comma-separated (default `ImagePullBackOff,InvalidImageName,ErrImageNeverPull,CreateContainerConfigError`). `--fail-fast-reasons=` disables the check; empty items and `CrashLoopBackOff` (see `--crashloop-restarts`) are rejected. See [Broken pods](#broken-pods) |
 | `--strimzi-kafka-api` | Strimzi Kafka CR API group/version |
 | `--strimzi-podset-api` | Strimzi StrimziPodSet API group/version |
 | `--kube-api-qps` | QPS for the Kubernetes API client (default 20, must be > 0) |
@@ -234,6 +235,7 @@ k8s-rollout-restart --version
 
 - Every Kubernetes API request has a fixed client timeout of 60 seconds, independent of `--timeout`.
 - `--timeout` is the rollout wait per resource: after a resource has been patched, the tool waits up to `--timeout` seconds for its pods to be replaced and ready. It is not a budget for the whole run.
+- For Deployments and StatefulSets a [broken pod](#broken-pods) of the new revision ends the wait early with a failure instead of running into `--timeout`.
 
 ### Failure handling
 
@@ -242,6 +244,17 @@ k8s-rollout-restart --version
 **Run-wide stop.** If anything fails during the run — a failed cordon, a restart PATCH that is rejected or has an unknown outcome (connection error, 5xx), a rollout that fails or times out, or an API error while waiting for a rollout (e.g. a forbidden pod List) — the tool stops starting new restarts immediately, for the whole run and across all resource types: a Deployment failure also prevents StatefulSet, Kafka and PostgreSQL restarts and vice versa. A timed-out rollout may still be running in the cluster, so its `--parallel` slot is not given to a new target. Restarts already in flight are allowed to finish (each within its own `--timeout`); a restart whose wait saw an API error is still waited for, and the error is reported even if the restart completes afterwards. A PostgreSQL marker PATCH that fails on any pod stops new launches at once; no further pod of that cluster is marked and the markers already set are removed. Every remaining target — including all targets of resource types that come later in the run — is reported as **not started due to earlier failure**, and the tool exits with a non-zero exit code.
 
 With `--skip-wait` rollouts are not observed, so only PATCH results count, but the rule is the same: any failed PATCH (a definite rejection such as 403 or an ambiguous outcome) stops new launches of every resource type. A PostgreSQL trigger whose outcome is unknown is reported as a failure even if the subsequent wait shows the rotation completed.
+
+#### Broken pods
+
+While a Deployment or StatefulSet rollout is awaited, the tool also checks the pods of the **new revision** (the Deployment's new ReplicaSet, or the StatefulSet's `status.updateRevision`). A pod that cannot become ready on its own fails the rollout at once instead of waiting for `--timeout`, and the failure stops new launches like any other (run-wide stop). The error names the pod, the (init) container, the reason and its message, or the restart count with the last exit reason and code.
+
+A pod is **broken** when a container or init container is waiting with:
+
+- a reason from `--fail-fast-reasons` (default `ImagePullBackOff`, `InvalidImageName`, `ErrImageNeverPull`, `CreateContainerConfigError`), or
+- `CrashLoopBackOff` with at least `--crashloop-restarts` restarts (default 3).
+
+**Slow** pods keep being waited for up to `--timeout`: `Pending` (e.g. waiting for a new node), `ContainerCreating`, `Running` but not `Ready` yet (long startup, readiness probe not passed), or `CrashLoopBackOff` below the threshold (e.g. a container that exits until a dependency is up). Pods of the old revision and terminating pods are ignored. With `--crashloop-restarts=0 --fail-fast-reasons=` both checks are disabled and no pods are listed. Kafka and PostgreSQL restarts are not affected.
 
 ### Dry run
 
@@ -289,23 +302,9 @@ The tool **never uncordons** nodes, on any path (success, failure or Ctrl-C): co
 kubectl get nodes -o json | jq -r '.items[] | select(.metadata.annotations["k8s-rollout-restart/cordoned-by"] != null) | .metadata.name'
 ```
 
-## Flagger Deployments
+## Workloads Scaled to Zero
 
-The utility has special handling for deployments managed by [Flagger](https://flagger.app/):
-
-- By default:
-  - For Flagger-managed deployments, only the primary deployments (with `-primary` suffix) are restarted
-  - Deployments without a Flagger primary counterpart are restarted directly
-  - Deployments that have a `-primary` counterpart are skipped (the primary is restarted instead)
-- Flagger-managed deployments are identified by an owner reference:
-  ```
-  ownerReferences:
-    - apiVersion: flagger.app/v1beta1
-      kind: Canary
-      controller: true
-  ```
-- Use `--no-flagger-filter` to restart all deployments regardless of this logic
-- StatefulSets are always restarted regardless of Flagger owner references
+Deployments and StatefulSets with `spec.replicas: 0` have no pods and are skipped (`scaled to zero (no pods)`).
 
 ## Pod Filters
 

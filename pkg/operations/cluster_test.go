@@ -280,7 +280,7 @@ func TestCordonNodes_ManyNodesMarkedAndRecorded(t *testing.T) {
 		f.addNode(name, false, nil)
 		f.addPod("app", "pod-"+name, name)
 	}
-	c := NewClusterOperations(f, parallel, 10, false, false)
+	c := NewClusterOperations(f, parallel, 10, false)
 
 	err := runWithTimeout(t, 5*time.Second, func() error {
 		return c.CordonNodes(context.Background(), []string{"app"}, false, nil, nil)
@@ -312,7 +312,7 @@ func TestCordonNodes_AllWorkersErrorNoHang(t *testing.T) {
 		f.addNode(name, false, nil)
 		f.addPod("app", "pod-"+name, name)
 	}
-	c := NewClusterOperations(f, parallel, 10, false, false)
+	c := NewClusterOperations(f, parallel, 10, false)
 
 	errBoom := errors.New("boom")
 	f.patchHook = func(context.Context, string, bool) error { return errBoom }
@@ -338,7 +338,7 @@ func TestCordonNodes_PreCordonedNodesNotClaimed(t *testing.T) {
 	f.addNode("admin-cordoned", true, nil)
 	f.addPod("app", "p1", "ours")
 	f.addPod("app", "p2", "admin-cordoned")
-	c := NewClusterOperations(f, 2, 10, false, false)
+	c := NewClusterOperations(f, 2, 10, false)
 
 	if err := c.CordonNodes(context.Background(), []string{"app"}, false, nil, nil); err != nil {
 		t.Fatalf("CordonNodes: %v", err)
@@ -363,7 +363,7 @@ func TestCordonNodes_ConcurrentAdminCordonNotClaimed(t *testing.T) {
 	f := newClusterFakeClient()
 	f.addNode("n1", false, nil)
 	f.addPod("app", "p1", "n1")
-	c := NewClusterOperations(f, 1, 10, false, false)
+	c := NewClusterOperations(f, 1, 10, false)
 
 	var once sync.Once
 	f.patchHook = func(_ context.Context, name string, _ bool) error {
@@ -393,7 +393,7 @@ func TestCordonNodes_ConflictRetried(t *testing.T) {
 	f := newClusterFakeClient()
 	f.addNode("n1", false, nil)
 	f.addPod("app", "p1", "n1")
-	c := NewClusterOperations(f, 1, 10, false, false)
+	c := NewClusterOperations(f, 1, 10, false)
 
 	var once sync.Once
 	f.patchHook = func(_ context.Context, name string, _ bool) error {
@@ -417,7 +417,7 @@ func TestCordonNodes_AppliedButResponseLost(t *testing.T) {
 	f := newClusterFakeClient()
 	f.addNode("n1", false, nil)
 	f.addPod("app", "p1", "n1")
-	c := NewClusterOperations(f, 1, 10, false, false)
+	c := NewClusterOperations(f, 1, 10, false)
 
 	f.afterPatchErr = func(string) error { return errors.New("connection reset by peer") }
 
@@ -434,7 +434,7 @@ func TestCordonNodes_ForbiddenNotRecorded(t *testing.T) {
 	f := newClusterFakeClient()
 	f.addNode("n1", false, nil)
 	f.addPod("app", "p1", "n1")
-	c := NewClusterOperations(f, 1, 10, false, false)
+	c := NewClusterOperations(f, 1, 10, false)
 	f.patchHook = func(context.Context, string, bool) error {
 		return apierrors.NewForbidden(nodesGR, "n1", errors.New("no patch"))
 	}
@@ -454,7 +454,7 @@ func TestCordonNodes_NodeDisappearsIsNotError(t *testing.T) {
 	f.addNode("stays", false, nil)
 	f.addPod("app", "p1", "gone")
 	f.addPod("app", "p2", "stays")
-	c := NewClusterOperations(f, 1, 10, false, false)
+	c := NewClusterOperations(f, 1, 10, false)
 
 	f.patchHook = func(_ context.Context, name string, _ bool) error {
 		if name == "gone" {
@@ -478,7 +478,7 @@ func TestCordonNodes_ContextCancellation(t *testing.T) {
 	for i := 0; i < nodeCount; i++ {
 		f.addNode(fmt.Sprintf("node-%02d", i), false, nil)
 	}
-	c := NewClusterOperations(f, parallel, 10, false, false)
+	c := NewClusterOperations(f, parallel, 10, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -516,7 +516,7 @@ func TestCordonNodes_LabelFilters(t *testing.T) {
 		f.addPod("app", "pod-"+n, n)
 	}
 	f.addPod("app", "pending", "") // unscheduled pod must be ignored
-	c := NewClusterOperations(f, 2, 10, false, false)
+	c := NewClusterOperations(f, 2, 10, false)
 
 	err := c.CordonNodes(context.Background(), []string{"app"}, false,
 		[]string{"role=worker"}, []string{"eks.amazonaws.com/compute-type=fargate"})
@@ -567,7 +567,7 @@ func TestCordonNodes_EmptyValueLabelFilterEndToEnd(t *testing.T) {
 	f.addNode("untagged", false, nil)
 	f.addPod("app", "p1", "tagged")
 	f.addPod("app", "p2", "untagged")
-	c := NewClusterOperations(f, 2, 10, false, false)
+	c := NewClusterOperations(f, 2, 10, false)
 
 	if err := c.CordonNodes(context.Background(), []string{"app"}, false, []string{"drain="}, nil); err != nil {
 		t.Fatalf("CordonNodes: %v", err)
@@ -581,7 +581,7 @@ func TestCordonNodes_DryRunDoesNotPatch(t *testing.T) {
 	f := newClusterFakeClient()
 	f.addNode("n1", false, nil)
 	f.addPod("app", "p1", "n1")
-	c := NewClusterOperations(f, 2, 10, false, true)
+	c := NewClusterOperations(f, 2, 10, true)
 
 	if err := c.CordonNodes(context.Background(), []string{"app"}, false, nil, nil); err != nil {
 		t.Fatalf("CordonNodes: %v", err)
@@ -600,7 +600,7 @@ func TestPlanCordon_SameSelectionAsExecute(t *testing.T) {
 	f.addPod("app", "p1", "a")
 	f.addPod("app", "p2", "b")
 	f.addPod("app", "p3", "c")
-	c := NewClusterOperations(f, 2, 10, false, true)
+	c := NewClusterOperations(f, 2, 10, true)
 
 	plan, err := c.PlanCordon(context.Background(), []string{"app"}, false, []string{"role=worker"}, nil)
 	if err != nil {
@@ -655,7 +655,7 @@ func TestPlanCordon_LocalVolumeWarnings(t *testing.T) {
 		localPV("pv-ebs", "db", "data-ebs", corev1.PersistentVolumeSpec{NodeAffinity: zone}),
 		localPV("pv-n2", "db", "data-n2", corev1.PersistentVolumeSpec{NodeAffinity: hostnameAffinity("n2")}),
 	}
-	c := NewClusterOperations(f, 2, 10, false, false)
+	c := NewClusterOperations(f, 2, 10, false)
 
 	plan, err := c.PlanCordon(context.Background(), []string{"db"}, false, nil, []string{"skip=yes"})
 	if err != nil {
@@ -694,7 +694,7 @@ func TestPlanCordon_LocalVolumeCheckCoversAllNamespaces(t *testing.T) {
 		localPV("pv-pg", "db", "data-pg", corev1.PersistentVolumeSpec{NodeAffinity: hostnameAffinity("n1")}),
 		localPV("pv-pg1", "db", "data-pg1", corev1.PersistentVolumeSpec{NodeAffinity: hostnameAffinity("n2")}),
 	}
-	c := NewClusterOperations(f, 2, 10, false, false)
+	c := NewClusterOperations(f, 2, 10, false)
 
 	plan, err := c.PlanCordon(context.Background(), []string{"app"}, false, nil, nil)
 	if err != nil {

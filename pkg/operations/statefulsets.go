@@ -32,8 +32,9 @@ type StatefulSetOperations struct {
 	podAnnotations  []string
 	containerImages []string
 	skipWait        bool
-	runStop         *RunStop      // run-wide stop signal shared with the other resource types
-	pollInterval    time.Duration // readiness poll interval (defaultPollInterval when zero)
+	runStop         *RunStop        // run-wide stop signal shared with the other resource types
+	pollInterval    time.Duration   // readiness poll interval (defaultPollInterval when zero)
+	podHealth       PodHealthPolicy // when an update-revision pod fails the rollout wait at once
 }
 
 // SetLogger replaces the logger (the configured root logger, so that
@@ -50,8 +51,14 @@ func (s *StatefulSetOperations) SetRunStop(rs *RunStop) {
 	s.runStop = rs
 }
 
+// SetPodHealthPolicy sets when a pod of the update revision is broken and
+// fails the rollout wait at once (DefaultPodHealthPolicy unless set).
+func (s *StatefulSetOperations) SetPodHealthPolicy(p PodHealthPolicy) {
+	s.podHealth = p
+}
+
 // NewStatefulSetOperations creates a new StatefulSetOperations instance
-func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, _, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, containerImages []string, skipWait bool) *StatefulSetOperations {
+func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, dryRun bool, minAge *time.Duration, podLabels []string, podAnnotations []string, containerImages []string, skipWait bool) *StatefulSetOperations {
 	return &StatefulSetOperations{
 		clientset:       clientset,
 		parallel:        parallel,
@@ -63,6 +70,7 @@ func NewStatefulSetOperations(clientset K8sClient, parallel, timeout int, _, dry
 		podAnnotations:  podAnnotations,
 		containerImages: containerImages,
 		skipWait:        skipWait,
+		podHealth:       DefaultPodHealthPolicy(),
 	}
 }
 
@@ -99,12 +107,15 @@ type statefulSetSelection struct {
 	toRestart      []appsv1.StatefulSet
 	postgres       []string
 	elasticsearch  []string
+	scaledToZero   []string // spec.replicas == 0: no pods to restart
 	tooYoung       []appsv1.StatefulSet
 	noMatchingPods []string
 	unsupported    []string // "name: reason" for update strategies a restart cannot complete under
 }
 
-// selectStatefulSets decides which StatefulSets in a namespace will be restarted.
+// selectStatefulSets decides which StatefulSets in a namespace will be
+// restarted. A StatefulSet scaled to zero (spec.replicas == 0) has no pods and
+// is skipped: patching its template would restart nothing.
 func (s *StatefulSetOperations) selectStatefulSets(ctx context.Context, namespace string) (*statefulSetSelection, error) {
 	statefulsets, err := s.clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -121,6 +132,10 @@ func (s *StatefulSetOperations) selectStatefulSets(ctx context.Context, namespac
 		}
 		if isElasticsearchStatefulSet(&statefulset) {
 			sel.elasticsearch = append(sel.elasticsearch, statefulset.Name)
+			continue
+		}
+		if statefulset.Spec.Replicas != nil && *statefulset.Spec.Replicas == 0 {
+			sel.scaledToZero = append(sel.scaledToZero, statefulset.Name)
 			continue
 		}
 		if s.minAge != nil && time.Since(statefulset.CreationTimestamp.Time) < *s.minAge {
@@ -240,6 +255,9 @@ func (s *StatefulSetOperations) logSelection(sel *statefulSetSelection) {
 		for _, name := range sel.elasticsearch {
 			s.log.Info("- %s (managed by ECK, skipped)", name)
 		}
+	}
+	for _, name := range sel.scaledToZero {
+		s.log.Info("Skipping StatefulSet %s/%s: scaled to zero (no pods)", ns, name)
 	}
 	for _, sts := range sel.tooYoung {
 		s.log.Info("Skipping StatefulSet %s/%s: too new (age: %s, required: %s)",
@@ -416,7 +434,10 @@ func (s *StatefulSetOperations) restartOne(ctx context.Context, rs *RunStop, nam
 }
 
 // waitForStatefulSetsReady waits for the restarted statefulsets to finish
-// their rollout. Every API call uses the bounded timeout context.
+// their rollout. Every API call uses the bounded timeout context. While a
+// rollout is in progress, the pods of the update revision are checked as
+// well: a pod that cannot become ready on its own (PodHealthPolicy) fails the
+// rollout at once instead of waiting for --timeout.
 func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, targets []rolloutTarget, trip func(error)) error {
 	check := func(ctx context.Context, t rolloutTarget) (bool, string, error, error) {
 		sts, err := s.clientset.AppsV1().StatefulSets(t.namespace).Get(ctx, t.name, metav1.GetOptions{})
@@ -427,9 +448,32 @@ func (s *StatefulSetOperations) waitForStatefulSetsReady(ctx context.Context, ta
 			return false, "", nil, err
 		}
 		done, reason := statefulSetRolloutStatus(sts, t.minGeneration)
-		return done, reason, nil, nil
+		if done || !s.podHealth.enabled() || sts.Status.ObservedGeneration < max(sts.Generation, t.minGeneration) {
+			return done, reason, nil, nil
+		}
+		broken, fetchErr := s.brokenUpdateRevisionPods(ctx, t.namespace, sts)
+		return false, reason, broken, fetchErr
 	}
 	return waitForRollouts(ctx, s.log, "StatefulSet", time.Duration(s.timeout)*time.Second, s.pollInterval, targets, check, trip)
+}
+
+// brokenUpdateRevisionPods returns a terminal error if a pod of the
+// StatefulSet's update revision cannot become ready on its own. Pods of the
+// old revision are ignored: they are being replaced. It must only be called
+// once the controller has observed the restart, so that
+// status.updateRevision is the revision created by it.
+func (s *StatefulSetOperations) brokenUpdateRevisionPods(ctx context.Context, namespace string, sts *appsv1.StatefulSet) (terminal, fetchErr error) {
+	revision := sts.Status.UpdateRevision
+	if revision == "" || sts.Spec.Selector == nil {
+		return nil, nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+	if err != nil {
+		return nil, nil
+	}
+	return s.podHealth.brokenPodsErr(ctx, s.clientset, namespace, selector.String(), func(pod *corev1.Pod) bool {
+		return controlledBy(pod, sts.UID) && pod.Labels[appsv1.ControllerRevisionHashLabelKey] == revision
+	})
 }
 
 // statefulSetRolloutStatus reports whether a StatefulSet has completed its

@@ -42,6 +42,7 @@ func newTestStatefulSetOps(client K8sClient, opts func(s *StatefulSetOperations)
 		timeout:      5,
 		log:          logger.NewLogger(false),
 		pollInterval: 10 * time.Millisecond,
+		podHealth:    DefaultPodHealthPolicy(),
 	}
 	if opts != nil {
 		opts(s)
@@ -142,7 +143,10 @@ func statefulSetScenario() []runtime.Object {
 	}
 	spilo := readyStatefulSet("ns", "pg")
 	spilo.Labels = map[string]string{"application": "spilo"}
-	return []runtime.Object{ok, onDelete, partitioned, partitionZero, spilo}
+	idle := readyStatefulSet("ns", "idle")
+	idle.Spec.Replicas = int32Ptr(0)
+	idle.Status = appsv1.StatefulSetStatus{ObservedGeneration: idle.Generation}
+	return []runtime.Object{ok, onDelete, partitioned, partitionZero, spilo, idle}
 }
 
 func TestStatefulSetSelectionParity(t *testing.T) {
@@ -153,7 +157,7 @@ func TestStatefulSetSelectionParity(t *testing.T) {
 		want      []string
 	}{
 		{
-			name:    "unsupported update strategies and operator-managed sets are skipped",
+			name:    "unsupported update strategies, scaled to zero and operator-managed sets are skipped",
 			objects: statefulSetScenario(),
 			want:    []string{"ns/ok", "ns/partition-zero"},
 		},

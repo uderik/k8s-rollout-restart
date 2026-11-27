@@ -39,7 +39,6 @@ var (
 	parallel        int
 	timeout         int
 	output          string
-	noFlagger       bool
 	doCordon        bool
 	cordonAllNodes  bool
 	resourceTypes   []string
@@ -52,6 +51,8 @@ var (
 	podAnnotations  []string
 	containerImages []string
 	skipWait        bool
+	crashLoopLimit  int
+	failFastReasons []string
 	showVersion     bool
 	kafkaAPIVer     string
 	podSetAPIVer    string
@@ -107,7 +108,6 @@ func init() {
 		"with --skip-wait only PATCH results count, but any failed PATCH stops further launches")
 	rootCmd.Flags().IntVarP(&timeout, "timeout", "t", 300, "Timeout in seconds, applied per resource (each rollout/cluster restart wait)")
 	rootCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text|json)")
-	rootCmd.Flags().BoolVar(&noFlagger, "no-flagger-filter", false, "Disable Flagger Canary filter (restart all deployments, not just Flagger primary ones)")
 	rootCmd.Flags().BoolVar(&doCordon, "cordon", false, "Cordon nodes before restart so pods move to other nodes. Nodes are intentionally LEFT CORDONED afterwards "+
 		"(e.g. for Karpenter to remove them) and marked with the "+operations.CordonedByAnnotation+"=<run-id> annotation; "+
 		"a 'kubectl uncordon' command for manual rollback is printed at the end")
@@ -122,6 +122,12 @@ func init() {
 	rootCmd.Flags().StringSliceVar(&podAnnotations, "pod-annotations", []string{}, "Only restart resources that have pods with these annotations (format: key=value). Multiple annotations can be specified comma-separated.")
 	rootCmd.Flags().StringSliceVar(&containerImages, "container-image", []string{}, "Only restart resources that have pods running a container whose image contains one of these substrings (e.g. proxyv2:1.27.1). Multiple values comma-separated (OR).")
 	rootCmd.Flags().BoolVar(&skipWait, "skip-wait", false, "Skip waiting for pods to become ready after restart")
+	rootCmd.Flags().IntVar(&crashLoopLimit, "crashloop-restarts", operations.DefaultCrashLoopRestarts,
+		"Fail a Deployment/StatefulSet rollout at once when a pod of the new revision is in CrashLoopBackOff with at least this many restarts "+
+			"(0 disables the check)")
+	rootCmd.Flags().StringSliceVar(&failFastReasons, "fail-fast-reasons", operations.DefaultFailFastReasons,
+		"Fail a Deployment/StatefulSet rollout at once when a container of a new-revision pod is waiting with one of these reasons, comma-separated "+
+			"(an empty value disables the check; CrashLoopBackOff is governed by --crashloop-restarts)")
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Show version information")
 	rootCmd.Flags().StringVar(&kafkaAPIVer, "strimzi-kafka-api", operations.DefaultKafkaAPIVersion, "Strimzi Kafka CR API group/version")
 	rootCmd.Flags().StringVar(&podSetAPIVer, "strimzi-podset-api", operations.DefaultStrimziPodSetAPIVersion, "Strimzi StrimziPodSet API group/version")
@@ -184,6 +190,9 @@ func runRoot(cmd *cobra.Command, _ []string) error {
 	}
 	if kubeAPIBurst < 1 {
 		return fmt.Errorf("--kube-api-burst must be at least 1 (got %d)", kubeAPIBurst)
+	}
+	if err := validateFailFastFlags(crashLoopLimit, failFastReasons); err != nil {
+		return err
 	}
 
 	// Validate resource types and filters first, before any expensive operations
@@ -419,12 +428,15 @@ func runInterruptible(parent stdcontext.Context, log *logger.Logger, sigCh <-cha
 // global flags. All of them log through log (the configured root logger), so
 // that --output=json yields JSON on every stdout line.
 func newMaintenanceOps(k8sClient operations.K8sClient, log *logger.Logger, minAge *time.Duration) maintenanceOps {
-	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, noFlagger, dryRun)
+	clusterOps := operations.NewClusterOperations(k8sClient, parallel, timeout, dryRun)
 	clusterOps.SetLogger(log)
-	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations, containerImages, skipWait)
+	deploymentOps := operations.NewDeploymentOperations(k8sClient, parallel, timeout, dryRun, minAge, podLabels, podAnnotations, containerImages, skipWait)
 	deploymentOps.SetLogger(log)
-	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, noFlagger, dryRun, minAge, podLabels, podAnnotations, containerImages, skipWait)
+	statefulSetOps := operations.NewStatefulSetOperations(k8sClient, parallel, timeout, dryRun, minAge, podLabels, podAnnotations, containerImages, skipWait)
 	statefulSetOps.SetLogger(log)
+	podHealth := operations.NewPodHealthPolicy(crashLoopLimit, failFastReasons)
+	deploymentOps.SetPodHealthPolicy(podHealth)
+	statefulSetOps.SetPodHealthPolicy(podHealth)
 	kafkaOps := operations.NewKafkaOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait, kafkaAPIVer, podSetAPIVer)
 	kafkaOps.SetLogger(log)
 	postgresqlOps := operations.NewPostgresqlOperations(k8sClient, parallel, timeout, dryRun, minAge, skipWait)
@@ -844,6 +856,24 @@ func validateFilterFlags(podLabels, podAnnotations, containerImages, nodeLabels,
 		// An empty substring matches every image, i.e. silently disables the filter.
 		if strings.TrimSpace(image) == "" {
 			return fmt.Errorf("invalid --container-image value: entries must not be empty")
+		}
+	}
+	return nil
+}
+
+// validateFailFastFlags validates --crashloop-restarts and
+// --fail-fast-reasons. An empty reason list (--fail-fast-reasons=) disables
+// the reason check, but an empty item inside a list is a typo and rejected.
+func validateFailFastFlags(crashLoopRestarts int, reasons []string) error {
+	if crashLoopRestarts < 0 {
+		return fmt.Errorf("--crashloop-restarts must be at least 0 (got %d; 0 disables the check)", crashLoopRestarts)
+	}
+	for _, reason := range reasons {
+		switch strings.TrimSpace(reason) {
+		case "":
+			return fmt.Errorf("invalid --fail-fast-reasons value: entries must not be empty (use --fail-fast-reasons= to disable the check)")
+		case operations.CrashLoopBackOffReason:
+			return fmt.Errorf("invalid --fail-fast-reasons value %q: CrashLoopBackOff is governed by --crashloop-restarts", reason)
 		}
 	}
 	return nil

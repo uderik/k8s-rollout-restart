@@ -177,7 +177,7 @@ func TestRootCommand_Flags(t *testing.T) {
 		"dry-run", "execute", "context", "namespace", "all-namespaces", "ignore-namespaces",
 		"parallel", "timeout", "output", "cordon", "cordon-all-nodes", "resources", "older-than",
 		"node-labels", "exclude-node-labels", "pod-labels", "pod-annotations", "container-image",
-		"skip-wait", "version",
+		"skip-wait", "crashloop-restarts", "fail-fast-reasons", "version",
 	} {
 		assert.NotNil(t, rootCmd.Flags().Lookup(name), "flag --%s must exist", name)
 	}
@@ -186,6 +186,50 @@ func TestRootCommand_Flags(t *testing.T) {
 	assert.Contains(t, cordon.Usage, operations.CordonedByAnnotation)
 	assert.Contains(t, rootCmd.Flags().Lookup("parallel").Usage, "across all namespaces")
 	assert.Contains(t, rootCmd.Flags().Lookup("timeout").Usage, "per resource")
+}
+
+func TestFailFastFlags_Validation(t *testing.T) {
+	assert.NoError(t, validateFailFastFlags(operations.DefaultCrashLoopRestarts, operations.DefaultFailFastReasons))
+	assert.NoError(t, validateFailFastFlags(0, nil), "0 and an empty list disable both checks")
+	assert.NoError(t, validateFailFastFlags(10, []string{"ImagePullBackOff", "ErrImagePull"}))
+
+	tests := []struct {
+		name     string
+		restarts int
+		reasons  []string
+		want     string
+	}{
+		{name: "negative restarts", restarts: -1, want: "--crashloop-restarts"},
+		{name: "CrashLoopBackOff in reasons", restarts: 3, reasons: []string{"ImagePullBackOff", "CrashLoopBackOff"}, want: "--crashloop-restarts"},
+		{name: "empty item", restarts: 3, reasons: []string{"ImagePullBackOff", ""}, want: "must not be empty"},
+		{name: "blank item", restarts: 3, reasons: []string{" "}, want: "must not be empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateFailFastFlags(tt.restarts, tt.reasons)
+			if assert.Error(t, err) {
+				assert.Contains(t, err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+// --fail-fast-reasons= parses to an empty list (check disabled, valid), while
+// an empty item inside a list ("a,,b") is rejected.
+func TestFailFastReasonsFlag_Parsing(t *testing.T) {
+	parse := func(arg string) []string {
+		var values []string
+		cmd := &cobra.Command{Use: "x", RunE: func(*cobra.Command, []string) error { return nil }}
+		cmd.Flags().StringSliceVar(&values, "fail-fast-reasons", operations.DefaultFailFastReasons, "")
+		assert.NoError(t, cmd.ParseFlags([]string{arg}))
+		return values
+	}
+	disabled := parse("--fail-fast-reasons=")
+	assert.Empty(t, disabled)
+	assert.NoError(t, validateFailFastFlags(3, disabled))
+
+	assert.Error(t, validateFailFastFlags(3, parse("--fail-fast-reasons=ImagePullBackOff,,InvalidImageName")))
+	assert.Equal(t, []string{"ErrImagePull"}, parse("--fail-fast-reasons=ErrImagePull"))
 }
 
 // An explicitly empty slice flag parses to an empty slice; only Changed tells

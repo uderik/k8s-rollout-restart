@@ -134,12 +134,12 @@ func TestRestartWorkloads_SelectionFailureStopsRun(t *testing.T) {
 				var err error
 				notStarted := "good/a: not started due to earlier failure"
 				if kind == "deployments" {
-					d := NewDeploymentOperations(client, 1, 1, true, false, nil, nil, nil, nil, skip)
+					d := NewDeploymentOperations(client, 1, 1, false, nil, nil, nil, nil, skip)
 					d.SetRunStop(rs)
 					err = d.RestartDeployments(context.Background(), []string{"bad", "good"})
 					notStarted = "deployment " + notStarted
 				} else {
-					s := NewStatefulSetOperations(client, 1, 1, true, false, nil, nil, nil, nil, skip)
+					s := NewStatefulSetOperations(client, 1, 1, false, nil, nil, nil, nil, skip)
 					s.SetRunStop(rs)
 					err = s.RestartStatefulSets(context.Background(), []string{"bad", "good"})
 					notStarted = "StatefulSet " + notStarted
@@ -362,7 +362,7 @@ func TestCordonNodes_LostResponseRequiresUnschedulable(t *testing.T) {
 	f := newClusterFakeClient()
 	f.addNode("n1", false, nil)
 	f.addPod("app", "p1", "n1")
-	c := NewClusterOperations(f, 1, 10, false, false)
+	c := NewClusterOperations(f, 1, 10, false)
 	f.afterPatchErr = func(name string) error {
 		// A concurrent admin's uncordon leaves the annotation intact.
 		f.setUnschedulable(name, false)
